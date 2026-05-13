@@ -1,0 +1,20 @@
+# Global owner — every PR pings @MichaelDanCurtis for review.
+*                            @MichaelDanCurtis
+
+# Per-area code owners. Add per-crate / per-domain owners as the team
+# grows; today everything is single-owner.
+
+# License & legal documents — never change these without the project
+# owner's explicit sign-off.
+LICENSE-MIT                  @MichaelDanCurtis
+LICENSE-APACHE               @MichaelDanCurtis
+NOTICE.md                    @MichaelDanCurtis
+SECURITY.md                  @MichaelDanCurtis
+
+# Workspace-wide configuration — review carefully (touches every crate).
+Cargo.toml                   @MichaelDanCurtis
+.github/                     @MichaelDanCurtis
+
+# Architecture docs — substantive changes are design decisions.
+docs/ARCHITECTURE.md         @MichaelDanCurtis
+docs/INTEGRATION.md          @MichaelDanCurtis

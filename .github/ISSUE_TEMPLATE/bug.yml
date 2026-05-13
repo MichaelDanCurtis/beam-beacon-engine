@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a defect in any engine crate.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing! Engine bugs surface in either Beam or Beacon,
+        so include enough detail that we can reproduce regardless of which
+        consumer hit it.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences describing the bug.
+    validations:
+      required: true
+  - type: dropdown
+    id: crate
+    attributes:
+      label: Which crate is affected?
+      multiple: true
+      options:
+        - bb-terminal-model
+        - bb-vt-parser
+        - bb-block-list
+        - bb-agent-loop
+        - bb-providers
+        - bb-tool-bridge
+        - bb-shared-session
+        - Workspace / tooling
+        - Unsure
+    validations:
+      required: true
+  - type: dropdown
+    id: consumer
+    attributes:
+      label: Which consumer surfaced this?
+      multiple: true
+      options:
+        - Beam (OSS)
+        - Beacon (proprietary)
+        - Engine tests only
+        - Other / unsure
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal repro. Include code snippets / shell commands.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Rust version (`rustc --version`), OS, consumer version
+        (Beam tag or Beacon build), and any relevant feature flags.
+      placeholder: |
+        - rustc:
+        - OS:
+        - Consumer + version:
+        - Notes:
+    validations:
+      required: false

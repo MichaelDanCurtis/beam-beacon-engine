@@ -1,0 +1,70 @@
+name: Crate extraction proposal
+description: Propose extracting a feature from Beam or Beacon into a shared engine crate.
+title: "[extraction] "
+labels: ["extraction", "design"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to propose moving a feature from Beam or Beacon
+        into a shared engine crate. Read `docs/INTEGRATION.md` first — it
+        defines the migration recipe this issue should track.
+  - type: dropdown
+    id: target-crate
+    attributes:
+      label: Target engine crate
+      description: Which engine crate should host the extracted code?
+      options:
+        - bb-terminal-model
+        - bb-vt-parser
+        - bb-block-list
+        - bb-agent-loop
+        - bb-providers
+        - bb-tool-bridge
+        - bb-shared-session
+        - New crate (specify in description)
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source codebase
+      multiple: true
+      options:
+        - Beam (OSS)
+        - Beacon (proprietary)
+        - Both (duplicated)
+    validations:
+      required: true
+  - type: textarea
+    id: source-paths
+    attributes:
+      label: Source paths
+      description: Exact paths in Beam and/or Beacon that this extraction draws from. Reference only — actual engine code MUST be rewritten clean per `CONTRIBUTING.md`.
+      placeholder: |
+        - Beam: `app/src/ai/agent_loop/computer_use_dispatcher.rs`
+        - Beacon: `core/src/agent/computer_use.rs`
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: Proposed engine API shape
+      description: Sketch the types / traits / functions you want to expose from the engine. Doesn't need to be final — this issue is the design discussion.
+    validations:
+      required: true
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open questions
+      description: Anything you're unsure about that you want consumer implementers to weigh in on before code lands.
+    validations:
+      required: false
+  - type: checkboxes
+    id: clean-room
+    attributes:
+      label: Clean-room confirmation
+      description: Engine code is rewritten cleanly. No verbatim copy-paste from Beam, Beacon, or upstream Warp.
+      options:
+        - label: I will write the engine implementation from scratch, using the source listings above only as reference.
+          required: true
