@@ -1,0 +1,53 @@
+# beam-beacon-engine — shared engine for Beam (OSS) and Beacon (proprietary).
+#
+# This workspace hosts every crate that needs to be shared between the two
+# terminal products. Both consumers pull from this repo via a git or path
+# dependency.
+#
+# Engineering principle: every crate here is 100% hand-coded by the Ailuxis
+# team. NOTHING extracted from upstream Warp (warpdotdev/warp) lands in this
+# repo, since Warp is dual MIT/AGPL and we don't want even MIT-licensed
+# upstream code mixed with the dual MIT-OR-Apache-2.0 grant we make here.
+# When a feature lives in both Beam and Beacon and we need to unify, we
+# rewrite it cleanly here.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version       = "0.0.0"
+edition       = "2021"
+rust-version  = "1.78"
+license       = "MIT OR Apache-2.0"
+authors       = ["Ailuxis <dev@ailuxis.com>"]
+repository    = "https://github.com/MichaelDanCurtis/beam-beacon-engine"
+homepage      = "https://github.com/MichaelDanCurtis/beam-beacon-engine"
+publish       = false
+
+[workspace.dependencies]
+# Shared deps land here once any crate needs them. Keeping empty for the
+# scaffold so the dep graph stays inspectable as the engine grows.
+
+# Per-workspace lints. Tighten as we add real code.
+[workspace.lints.rust]
+unused_must_use         = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all                  = { level = "warn", priority = -1 }
+todo                 = "warn"
+dbg_macro            = "warn"
+unwrap_used          = "warn"
+expect_used          = "warn"
+
+# Cargo profile tuning: fast iteration in dev, optimized in release.
+[profile.dev]
+opt-level = 0
+debug     = true
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+codegen-units = 1
+debug     = "line-tables-only"
