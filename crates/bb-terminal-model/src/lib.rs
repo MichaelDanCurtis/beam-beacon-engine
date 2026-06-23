@@ -30,6 +30,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::VecDeque;
+use std::num::NonZeroU32;
+
 // -----------------------------------------------------------------------------
 // Cell
 // -----------------------------------------------------------------------------
@@ -86,6 +89,38 @@ pub struct CellAttrs {
     pub blink: bool,
     /// Hidden (SGR 8).
     pub hidden: bool,
+    /// Hyperlink this cell belongs to (OSC 8), if any.
+    ///
+    /// This is an opaque interner id rather than the URL itself: many
+    /// adjacent cells share the same target, so storing a small `Copy`
+    /// id keeps [`CellAttrs`] cheap to clone. Resolving an id back to its
+    /// URI is the responsibility of a higher layer that owns the
+    /// hyperlink table; this crate only carries the reference.
+    pub hyperlink: Option<HyperlinkId>,
+}
+
+// -----------------------------------------------------------------------------
+// HyperlinkId
+// -----------------------------------------------------------------------------
+
+/// Opaque identifier for an OSC 8 hyperlink target.
+///
+/// The id is non-zero so that `Option<HyperlinkId>` occupies the same space
+/// as a bare `u32` (niche optimization). Ids are minted by whatever layer
+/// owns the hyperlink table; `bb-terminal-model` treats them as opaque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HyperlinkId(NonZeroU32);
+
+impl HyperlinkId {
+    /// Wrap a raw id. Returns `None` if `raw` is zero.
+    pub fn new(raw: u32) -> Option<Self> {
+        NonZeroU32::new(raw).map(Self)
+    }
+
+    /// The underlying non-zero id value.
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -261,6 +296,80 @@ pub struct Viewport {
 }
 
 // -----------------------------------------------------------------------------
+// Scrollback
+// -----------------------------------------------------------------------------
+
+/// A bounded ring buffer of rows that have scrolled off the top of a [`Grid`].
+///
+/// Each stored line is the row of [`Cell`]s as it appeared when it scrolled
+/// out of view. Lines keep whatever width they had at that moment, so a
+/// later [`Grid::resize`] does not retroactively reflow history.
+///
+/// The buffer is bounded: once it holds `max_lines`, pushing a new line
+/// evicts the oldest. A `max_lines` of `0` means scrollback is disabled and
+/// every push is a no-op.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scrollback {
+    lines: VecDeque<Vec<Cell>>,
+    max_lines: usize,
+}
+
+impl Scrollback {
+    /// Create an empty scrollback that retains at most `max_lines` rows.
+    pub fn new(max_lines: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            max_lines,
+        }
+    }
+
+    /// Append a line that has scrolled off the top.
+    ///
+    /// If the buffer is already at capacity the oldest line is evicted
+    /// first. When `max_lines` is `0` the line is dropped immediately.
+    pub fn push(&mut self, line: Vec<Cell>) {
+        if self.max_lines == 0 {
+            return;
+        }
+        if self.lines.len() == self.max_lines {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    /// Number of lines currently retained.
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Whether the scrollback holds no lines.
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Maximum number of lines this buffer will retain.
+    pub fn max_lines(&self) -> usize {
+        self.max_lines
+    }
+
+    /// Borrow the line at `index`, where `0` is the *oldest* retained line.
+    /// Returns `None` if out of bounds.
+    pub fn line(&self, index: usize) -> Option<&[Cell]> {
+        self.lines.get(index).map(Vec::as_slice)
+    }
+
+    /// Iterate over retained lines from oldest to newest.
+    pub fn iter(&self) -> impl Iterator<Item = &[Cell]> {
+        self.lines.iter().map(Vec::as_slice)
+    }
+
+    /// Discard every retained line. Capacity (`max_lines`) is unchanged.
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -353,5 +462,118 @@ mod tests {
     #[test]
     fn color_default_is_terminal_default() {
         assert_eq!(Color::default(), Color::Default);
+    }
+
+    #[test]
+    fn cell_attrs_default_has_no_hyperlink() {
+        assert_eq!(CellAttrs::default().hyperlink, None);
+    }
+
+    #[test]
+    fn hyperlink_id_rejects_zero_and_round_trips() {
+        assert_eq!(HyperlinkId::new(0), None);
+        let id = HyperlinkId::new(42).unwrap();
+        assert_eq!(id.get(), 42);
+    }
+
+    #[test]
+    fn hyperlink_option_is_niche_optimized() {
+        // Option<HyperlinkId> should be the same size as a bare u32.
+        assert_eq!(
+            core::mem::size_of::<Option<HyperlinkId>>(),
+            core::mem::size_of::<u32>()
+        );
+    }
+
+    #[test]
+    fn cell_carries_hyperlink_reference() {
+        let mut cell = Cell::default();
+        cell.attrs.hyperlink = HyperlinkId::new(7);
+        assert_eq!(cell.attrs.hyperlink.unwrap().get(), 7);
+    }
+
+    fn row(chars: &str) -> Vec<Cell> {
+        chars
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                attrs: CellAttrs::default(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scrollback_starts_empty() {
+        let sb = Scrollback::new(10);
+        assert!(sb.is_empty());
+        assert_eq!(sb.len(), 0);
+        assert_eq!(sb.max_lines(), 10);
+        assert!(sb.line(0).is_none());
+    }
+
+    #[test]
+    fn scrollback_default_is_disabled() {
+        let mut sb = Scrollback::default();
+        assert_eq!(sb.max_lines(), 0);
+        sb.push(row("ignored"));
+        assert!(sb.is_empty());
+    }
+
+    #[test]
+    fn scrollback_retains_lines_oldest_first() {
+        let mut sb = Scrollback::new(4);
+        sb.push(row("aaa"));
+        sb.push(row("bbb"));
+        assert_eq!(sb.len(), 2);
+        assert_eq!(sb.line(0).unwrap(), row("aaa").as_slice());
+        assert_eq!(sb.line(1).unwrap(), row("bbb").as_slice());
+    }
+
+    #[test]
+    fn scrollback_evicts_oldest_at_capacity() {
+        let mut sb = Scrollback::new(2);
+        sb.push(row("one"));
+        sb.push(row("two"));
+        sb.push(row("three"));
+        assert_eq!(sb.len(), 2);
+        assert_eq!(sb.line(0).unwrap(), row("two").as_slice());
+        assert_eq!(sb.line(1).unwrap(), row("three").as_slice());
+    }
+
+    #[test]
+    fn scrollback_zero_capacity_drops_everything() {
+        let mut sb = Scrollback::new(0);
+        sb.push(row("x"));
+        sb.push(row("y"));
+        assert!(sb.is_empty());
+    }
+
+    #[test]
+    fn scrollback_iter_yields_oldest_to_newest() {
+        let mut sb = Scrollback::new(3);
+        sb.push(row("1"));
+        sb.push(row("2"));
+        sb.push(row("3"));
+        let chars: String = sb.iter().map(|line| line[0].ch).collect();
+        assert_eq!(chars, "123");
+    }
+
+    #[test]
+    fn scrollback_preserves_varying_line_widths() {
+        let mut sb = Scrollback::new(2);
+        sb.push(row("short"));
+        sb.push(row("a much longer line"));
+        assert_eq!(sb.line(0).unwrap().len(), 5);
+        assert_eq!(sb.line(1).unwrap().len(), 18);
+    }
+
+    #[test]
+    fn scrollback_clear_keeps_capacity() {
+        let mut sb = Scrollback::new(5);
+        sb.push(row("a"));
+        sb.push(row("b"));
+        sb.clear();
+        assert!(sb.is_empty());
+        assert_eq!(sb.max_lines(), 5);
     }
 }

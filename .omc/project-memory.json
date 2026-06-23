@@ -1,0 +1,92 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1782246266912,
+  "projectRoot": "/Volumes/Main External/Development/beam-beacon-engine",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": "1.78",
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cargo build",
+    "testCommand": "cd \"/Volumes/Main External/Development/beam-beacon-engine\" && cargo fmt -p bb-terminal-model 2>&1 && echo \"=== TEST ===\" && cargo test -p bb-terminal-model 2>&1 | tail -30 && echo \"=== CLIPPY ===\" && cargo clippy -p bb-terminal-model -- -D warnings 2>&1 | tail -15",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "crates": {
+      "path": "crates",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1782246266897,
+      "keyFiles": []
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 3,
+      "lastAccessed": 1782246266898,
+      "keyFiles": [
+        "ARCHITECTURE.md",
+        "INTEGRATION.md",
+        "MIGRATION-CHECKLIST.md"
+      ]
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1782246266898,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "crates/bb-terminal-model/src/lib.rs",
+      "accessCount": 5,
+      "lastAccessed": 1782246406926,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 1,
+      "lastAccessed": 1782246286815,
+      "type": "file"
+    },
+    {
+      "path": "crates/bb-terminal-model/Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1782246298350,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
