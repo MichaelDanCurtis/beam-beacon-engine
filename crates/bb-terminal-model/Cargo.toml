@@ -16,3 +16,11 @@ workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+# Derives `Serialize`/`Deserialize` on all pure-data types. Off by default.
+serde = ["dep:serde"]
+
+[dependencies]
+unicode-width.workspace = true
+serde = { workspace = true, optional = true }

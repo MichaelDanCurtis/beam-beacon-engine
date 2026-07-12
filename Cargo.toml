@@ -26,8 +26,23 @@ homepage      = "https://github.com/MichaelDanCurtis/beam-beacon-engine"
 publish       = false
 
 [workspace.dependencies]
-# Shared deps land here once any crate needs them. Keeping empty for the
-# scaffold so the dep graph stays inspectable as the engine grows.
+# Shared deps land here once any crate needs them, so every crate pins the
+# same version and the dep graph stays inspectable as the engine grows.
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+thiserror     = "1"
+futures       = "0.3"
+tokio         = { version = "1", default-features = false }
+unicode-width = "0.1"
+
+# Intra-workspace crates, so consumers write `bb-x.workspace = true`.
+bb-terminal-model = { path = "crates/bb-terminal-model" }
+bb-vt-parser      = { path = "crates/bb-vt-parser" }
+bb-block-list     = { path = "crates/bb-block-list" }
+bb-providers      = { path = "crates/bb-providers" }
+bb-tool-bridge    = { path = "crates/bb-tool-bridge" }
+bb-agent-loop     = { path = "crates/bb-agent-loop" }
+bb-shared-session = { path = "crates/bb-shared-session" }
 
 # Per-workspace lints. Tighten as we add real code.
 [workspace.lints.rust]
