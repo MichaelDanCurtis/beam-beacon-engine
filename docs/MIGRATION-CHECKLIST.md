@@ -18,7 +18,7 @@ The lowest-level crate, no engine-internal deps. The natural starting
 point because both Beam and Beacon have well-tested implementations and
 the data model is uncontroversial.
 
-- [ ] **Design PR.** Open an `[extraction]` issue listing the source
+- [x] **Design PR.** Open an `[extraction]` issue listing the source
       paths in Beam (`crates/vt100/...`, `app/src/blocks/grid.rs`) and
       Beacon's equivalent. Sketch the public type surface:
       - `Cell { ch: char, attrs: CellAttrs }`
@@ -27,7 +27,7 @@ the data model is uncontroversial.
       - `Cursor { row, col, shape, visible }`
       - `Viewport { top: usize, height: usize }`
       - `Scrollback` (ring buffer)
-- [ ] **Implementation PR.** Land the types + tests. Aim for 80%+ line
+- [x] **Implementation PR.** Land the types + tests. Aim for 80%+ line
       coverage on `bb-terminal-model` since it's the foundation.
 - [ ] **Beam adoption PR.** Replace Beam's in-tree types with engine
       types via a thin shim that preserves Beam's call sites.
@@ -39,8 +39,8 @@ the data model is uncontroversial.
 Depends on `bb-terminal-model`. Mostly mechanical because the VT100 /
 ANSI handling is well-known.
 
-- [ ] Design PR — public API: `Parser { fn feed(&mut self, bytes: &[u8], grid: &mut Grid) }`
-- [ ] Implementation PR — full CSI / SGR / OSC / DCS support. Property
+- [x] Design PR — public API: `Parser { fn feed(&mut self, bytes: &[u8], grid: &mut Grid) }`
+- [x] Implementation PR — full CSI / SGR / OSC / DCS support. Property
       tests against the existing in-tree parsers (run the same input
       through engine + consumer-in-tree and assert identical grid state)
 - [ ] Beam adoption PR
@@ -51,8 +51,8 @@ ANSI handling is well-known.
 
 Depends on `bb-terminal-model`. The Warp-style block lifecycle.
 
-- [ ] Design PR — public API: `BlockList { … }`, `Block { id, lifecycle, … }`
-- [ ] Implementation PR — OSC 133 + heuristics, search, navigation
+- [x] Design PR — public API: `BlockList { … }`, `Block { id, lifecycle, … }`
+- [x] Implementation PR — OSC 133 + heuristics, search, navigation
 - [ ] Beam adoption PR
 - [ ] Beacon adoption PR
 - [ ] Cleanup PR
@@ -62,15 +62,15 @@ Depends on `bb-terminal-model`. The Warp-style block lifecycle.
 No engine-internal deps. Defines the `ProviderMessage` /
 `ProviderEvent` types that the agent loop will use.
 
-- [ ] Design PR — `ProviderMessage` enum, `MessageImage`, `ToolCall`,
+- [x] Design PR — `ProviderMessage` enum, `MessageImage`, `ToolCall`,
       `ToolResult`, `ProviderEvent` (streaming), `StopReason`.
       Per-provider encoder traits.
-- [ ] Implementation PR — Anthropic encoder
-- [ ] Implementation PR — OpenAI-compat encoder (covers OpenAI,
+- [x] Implementation PR — Anthropic encoder
+- [x] Implementation PR — OpenAI-compat encoder (covers OpenAI,
       OpenRouter, Together, Groq, Moonshot, custom proxies)
-- [ ] Implementation PR — Gemini encoder
-- [ ] Implementation PR — Ollama encoder
-- [ ] Implementation PR — Local-OpenAI-compat encoder
+- [x] Implementation PR — Gemini encoder
+- [x] Implementation PR — Ollama encoder
+- [x] Implementation PR — Local-OpenAI-compat encoder
 - [ ] Beam adoption PR — Beam's request-time runner consumes
       `bb-providers` instead of its own `agent_loop::provider`.
 - [ ] Beacon adoption PR — same shape.
@@ -80,14 +80,14 @@ No engine-internal deps. Defines the `ProviderMessage` /
 
 Depends on `bb-providers` (for `ToolResult` shape).
 
-- [ ] Design PR — `Tool` trait, `ToolDispatchResult`,
+- [x] Design PR — `Tool` trait, `ToolDispatchResult`,
       `ComputerUseDispatcher` analogue.
-- [ ] Implementation PR — Shell, Read, Write, Edit
-- [ ] Implementation PR — ComputerUse (Anthropic computer-use tool;
+- [x] Implementation PR — Shell, Read, Write, Edit
+- [x] Implementation PR — ComputerUse (Anthropic computer-use tool;
       images flow through `ToolDispatchResult.images`)
-- [ ] Implementation PR — Subagent dispatcher (Cli, Research, Advice,
+- [x] Implementation PR — Subagent dispatcher (Cli, Research, Advice,
       Summarization, ComputerUse, ConversationSearch, WarpDocumentationSearch)
-- [ ] Implementation PR — WebFetch, WebSearch
+- [x] Implementation PR — WebFetch, WebSearch
 - [ ] Beam adoption PR
 - [ ] Beacon adoption PR
 - [ ] Cleanup PR
@@ -96,12 +96,12 @@ Depends on `bb-providers` (for `ToolResult` shape).
 
 Largest surface area. Depends on `bb-providers` and `bb-tool-bridge`.
 
-- [ ] Design PR — `AgentLoop`, `Turn`, `Conversation`, `CancellationToken`
-- [ ] Implementation PR — turn structure, streaming, retry policy
-- [ ] Implementation PR — cancellation at every await point (see prior
+- [x] Design PR — `AgentLoop`, `Turn`, `Conversation`, `CancellationToken`
+- [x] Implementation PR — turn structure, streaming, retry policy
+- [x] Implementation PR — cancellation at every await point (see prior
       `tokio-broadcast-forwarder-stops-before-publisher-drops` and
       `ui-cancel-must-update-async-driven-state` notes)
-- [ ] Implementation PR — context window / summarization
+- [x] Implementation PR — context window / summarization
 - [ ] Beam adoption PR
 - [ ] Beacon adoption PR
 - [ ] Cleanup PR
@@ -110,8 +110,8 @@ Largest surface area. Depends on `bb-providers` and `bb-tool-bridge`.
 
 Depends on every other crate.
 
-- [ ] Design PR — `Session` aggregate
-- [ ] Implementation PR — wire together terminal-model + block-list +
+- [x] Design PR — `Session` aggregate
+- [x] Implementation PR — wire together terminal-model + block-list +
       agent-loop + history (KV store trait)
 - [ ] Beam adoption PR — Beam's top-level session module becomes a thin
       wrapper around `bb-shared-session`.

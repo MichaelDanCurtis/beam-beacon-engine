@@ -26,7 +26,7 @@ Both products consume this repository as a workspace of small focused crates. Be
 
 ## Status
 
-> **Early scaffold.** The crates listed below are empty stubs. Real implementations land in subsequent PRs as we extract code from Beam and Beacon — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md) for the migration plan.
+> **Implemented, pre-adoption.** All seven crates below have full, freshly-written implementations with extensive test suites (300+ tests workspace-wide), and CI enforces `cargo test`, `clippy -D warnings`, and `fmt --check`. What remains is consumer-side: wiring Beam and Beacon to depend on the engine and deleting their in-tree duplicates — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and [`docs/MIGRATION-CHECKLIST.md`](docs/MIGRATION-CHECKLIST.md).
 
 ## Crates
 
