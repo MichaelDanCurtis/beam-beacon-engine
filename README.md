@@ -92,9 +92,14 @@ This is currently internal Ailuxis infrastructure. We'll open contribution paths
 ```bash
 cargo check --workspace          # fast type-check across all crates
 cargo build --workspace          # build every crate
-cargo test  --workspace          # run every test
+cargo test  --workspace          # run every test, including doctests
 cargo fmt   --all                # format everything
 cargo clippy --workspace -- -D warnings
+cargo deny check                 # license / advisory / source gate
 ```
 
-Minimum Rust version: **1.78** (set in `[workspace.package].rust-version`).
+Note that `cargo test --workspace --all-targets` **skips doctests** — CI runs
+`--all-targets` and `--doc` as separate steps for that reason.
+
+Minimum Rust version: **1.78** (set in `[workspace.package].rust-version`)
+and verified by a dedicated CI job, since both consumers pin to it.

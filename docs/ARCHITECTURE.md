@@ -33,8 +33,12 @@ ship as a closed-source commercial product.
 ## License-cascade safety
 
 The engine is licensed `MIT OR Apache-2.0`. **No upstream-Warp code lives
-in this repository.** That rule is enforced socially (in
-`CONTRIBUTING.md`) and reinforced in `NOTICE.md`:
+in this repository.** Hand-written provenance is enforced socially (in
+`CONTRIBUTING.md`) and reinforced in `NOTICE.md`. The *dependency* side is
+enforced mechanically: `deny.toml` restricts the graph to a permissive
+license allowlist and forbids git dependencies outright, so CI fails
+before a copyleft — or an arbitrary-repo — dependency can reach either
+consumer:
 
 - The Beam fork still descends from upstream Warp. Even though Beam
   itself flipped to MIT OR Apache-2.0 by exercising Warp's MIT offer,
