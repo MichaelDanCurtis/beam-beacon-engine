@@ -6,3 +6,6 @@
 .idea/
 .vscode/
 *.iml
+
+# oh-my-claudecode session state
+.omc/

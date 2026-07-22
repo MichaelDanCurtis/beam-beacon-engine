@@ -1,0 +1,127 @@
+# cargo-deny configuration — the mechanical half of this repo's licensing rule.
+#
+# `beam-beacon-engine` exists so Beam (OSS, MIT/Apache-2.0) and Beacon
+# (proprietary, sold) can share code without a copyleft cascade. docs/ARCHITECTURE.md
+# describes that rule; CONTRIBUTING.md asks humans to honor it. This file is what
+# makes CI *enforce* it: a GPL/AGPL/LGPL/MPL dependency, or a dependency pulled
+# from an unvetted source, fails the build instead of relying on a reviewer
+# noticing it.
+#
+# Run locally with:  cargo deny check
+# (install once with: cargo install cargo-deny)
+
+[graph]
+# Check every target both consumers ship on, rather than only the host triple.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+all-features = true
+
+# -----------------------------------------------------------------------------
+# Licenses — the load-bearing section.
+# -----------------------------------------------------------------------------
+[licenses]
+version = 2
+# Allowlist ONLY. Anything not named here fails, which is the desired default:
+# a new dependency under GPL-3.0, AGPL-3.0, LGPL-3.0, or MPL-2.0 cannot land
+# without an explicit, reviewed change to this file.
+#
+# Unicode-3.0 is required by `unicode-ident` (licensed
+# "(MIT OR Apache-2.0) AND Unicode-3.0"). It is a permissive Unicode data
+# license with no copyleft obligation, so it is safe for Beacon to ship.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+# Several entries above are forward-looking: BSD/ISC/Zlib are unambiguously
+# permissive and safe for Beacon to ship, but nothing in the graph uses them
+# today. Don't warn about allowances that aren't currently exercised.
+unused-allowed-license = "allow"
+
+# Every crate in this workspace is ours and is dual MIT OR Apache-2.0. It is
+# marked `publish = false`, so cargo-deny sees no license text to match against
+# a registry copy; state the license explicitly.
+[[licenses.clarify]]
+name = "bb-terminal-model"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "bb-vt-parser"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "bb-block-list"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "bb-providers"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "bb-tool-bridge"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "bb-agent-loop"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "bb-shared-session"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+# -----------------------------------------------------------------------------
+# Bans — keep the dependency graph small and inspectable.
+# -----------------------------------------------------------------------------
+[bans]
+# The engine is a substrate two products embed; duplicate versions of the same
+# crate bloat both binaries. Warn rather than deny so a transitive bump doesn't
+# hard-block a PR.
+multiple-versions = "warn"
+# A `*` version on a crates.io dependency is a supply-chain hazard: it silently
+# accepts any future release. Deny it — but exempt intra-workspace `path`
+# dependencies, which are legitimately versionless so that a release only has to
+# bump `[workspace.package].version` in one place.
+wildcards = "deny"
+allow-wildcard-paths = true
+# Prefer the workspace dependency table over per-crate version strings.
+workspace-default-features = "allow"
+
+# -----------------------------------------------------------------------------
+# Advisories — known vulnerabilities and unmaintained crates.
+# -----------------------------------------------------------------------------
+[advisories]
+version = 2
+yanked = "deny"
+# `unmaintained` findings are informational for a crate this small; surface them
+# without blocking a release on an upstream maintainer's availability.
+unmaintained = "workspace"
+
+# -----------------------------------------------------------------------------
+# Sources — where code is allowed to come from.
+# -----------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+# No git dependencies. This is deliberate and doubles as provenance enforcement:
+# engine code cannot silently acquire a dependency on an arbitrary repository
+# (including any Warp-derived one) without an explicit change here.
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

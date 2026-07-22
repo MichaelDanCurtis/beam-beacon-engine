@@ -5,7 +5,7 @@ and Beacon directly" to "engine code lives in `beam-beacon-engine`,
 both consumers pull it." Read this BEFORE landing any extraction PR
 so we don't end up with three copies of the same logic.
 
-## Current state (snapshot at scaffold time)
+## Current state
 
 - **Beam** (`MichaelDanCurtis/WarpMod`) has an in-tree implementation of
   every engine concern. Most of it sits in `app/src/ai/...` (agent
@@ -14,8 +14,12 @@ so we don't end up with three copies of the same logic.
 - **Beacon** (`MichaelDanCurtis/Beacon` — `WarpClone/beacon-core` +
   `beacon-mac`) has hand-coded analogues with substantial overlap. The
   agent loop and the provider abstraction are the most duplicated.
-- **`beam-beacon-engine`** (this repo) is empty. Crates exist as
-  stubs. Nothing depends on them yet.
+- **`beam-beacon-engine`** (this repo) is **implemented**. All seven
+  crates have full implementations and test suites; CI enforces
+  `cargo test` (including doctests), `clippy -D warnings`,
+  `fmt --check`, an MSRV build, and `cargo deny`. **No consumer depends
+  on the engine yet** — steps 3–5 of the recipe below are the remaining
+  work, and they happen in the consumer repos.
 
 ## Migration order
 
@@ -119,14 +123,14 @@ opening a PR; commit only the git-dep entry.
 | Risk                                                          | Mitigation                                                              |
 | ------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | Engine API churn during migration breaks Beam OR Beacon       | Pin consumers to specific commits, not branches. Bump only after both pass. |
-| Engine code accidentally vendored from upstream Warp          | Code review checks every new file's provenance; `CONTRIBUTING.md` is explicit. |
+| Engine code accidentally vendored from upstream Warp          | Code review checks every new file's provenance; `CONTRIBUTING.md` is explicit. `cargo deny` (see `deny.toml`) mechanically blocks copyleft licenses and *all* git dependencies, so nothing can arrive from an arbitrary repo without an explicit config change. |
 | Beacon-only feature leaks into the engine                     | Keep Beacon-specific features in Beacon. The engine is the **intersection**, not the union. |
 | ARC client logic ends up here                                 | ARC is a service; its client lives in either Beam, Beacon, or its own client crate — not here. |
 | Public API set in stone too early                             | Crates stay at `0.0.x` until both consumers depend on them in earnest. |
 
 ## Open decisions
 
-These don't block the scaffold but need answers before we hit `0.1.0`:
+These don't block consumer adoption but need answers before we hit `0.1.0`:
 
 1. **Crate naming.** Current prefix is `bb-` (Beam Beacon). Do we want
    to rename to a brand-neutral prefix once `ailuxis.com` solidifies as
@@ -139,6 +143,11 @@ These don't block the scaffold but need answers before we hit `0.1.0`:
 3. **WebAssembly target.** Does Beacon ever need a wasm build of any
    engine crate? If yes, gate `bb-tool-bridge` features behind a `wasm`
    cfg flag.
-4. **Telemetry / metrics.** Where does the agent loop emit metrics from?
-   Probably a host-provided trait so each consumer can plug its own
-   sink (Beam → console; Beacon → enterprise telemetry; tests → in-memory).
+4. ~~**Telemetry / metrics.**~~ **DECIDED** — host-provided trait, as
+   expected. `bb-agent-loop` exposes `MetricsSink` + `MetricEvent`, wired
+   via the additive `AgentLoop::with_metrics`. Default is no sink, so the
+   uninstrumented path allocates nothing. Beam plugs in a console sink,
+   Beacon its enterprise telemetry, tests
+   `bb_agent_loop::testing::RecordingMetricsSink`. Settled before
+   adoption deliberately: adding an observability hook after consumers
+   pin the API would be a breaking change.

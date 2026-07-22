@@ -33,8 +33,12 @@ ship as a closed-source commercial product.
 ## License-cascade safety
 
 The engine is licensed `MIT OR Apache-2.0`. **No upstream-Warp code lives
-in this repository.** That rule is enforced socially (in
-`CONTRIBUTING.md`) and reinforced in `NOTICE.md`:
+in this repository.** Hand-written provenance is enforced socially (in
+`CONTRIBUTING.md`) and reinforced in `NOTICE.md`. The *dependency* side is
+enforced mechanically: `deny.toml` restricts the graph to a permissive
+license allowlist and forbids git dependencies outright, so CI fails
+before a copyleft — or an arbitrary-repo — dependency can reach either
+consumer:
 
 - The Beam fork still descends from upstream Warp. Even though Beam
   itself flipped to MIT OR Apache-2.0 by exercising Warp's MIT offer,
@@ -144,7 +148,27 @@ implementations behind it. The core abstraction is a `ProviderMessage`
 / `ProviderEvent` pair whose multimodal content (text + images + tool
 calls + tool results) is encoded into each provider's wire format by a
 per-provider encoder. The same `ProviderMessage` round-trips through any
-provider without lossy conversion. Encoders covered:
+provider without lossy conversion.
+
+Two contracts a host **must** honor:
+
+- **`StreamDecoder::finish()` must be called at end of stream.** Several
+  providers only imply the end of a turn (a server may omit
+  `data: [DONE]`, or a final NDJSON line may have no trailing newline).
+  `finish()` flushes the residual frame and synthesizes the terminal
+  event. Skipping it silently discards a fully-received answer.
+- **Transport failures must be reported as `Err`.** `Provider::call`
+  returning `Ok(())` asserts the stream ended *cleanly*. The agent loop
+  relies on that distinction: a clean stream with no explicit stop
+  reason completes the turn, while an `Err` never has its partial
+  content salvaged.
+
+Thinking text is carried as a `ThinkingBlock` (text plus an opaque
+provider signature) rather than a bare string, because Anthropic
+requires the signature when a thinking block is replayed in a later
+assistant turn.
+
+Encoders covered:
 
 - Anthropic Messages API (image blocks, thinking, prompt caching)
 - OpenAI-compatible Chat Completions and Responses APIs (`image_url`
