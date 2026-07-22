@@ -26,7 +26,7 @@ Both products consume this repository as a workspace of small focused crates. Be
 
 ## Status
 
-> **Implemented, pre-adoption.** All seven crates below have full, freshly-written implementations with extensive test suites (300+ tests workspace-wide), and CI enforces `cargo test`, `clippy -D warnings`, and `fmt --check`. What remains is consumer-side: wiring Beam and Beacon to depend on the engine and deleting their in-tree duplicates — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and [`docs/MIGRATION-CHECKLIST.md`](docs/MIGRATION-CHECKLIST.md).
+> **Implemented, pre-adoption.** All seven crates below have full, freshly-written implementations backed by 365 tests at 96% line coverage, including end-to-end tests that drive realistic shell transcripts through the whole seam. CI enforces eight gates: libs-only build, tests, doctests, a coverage floor, `clippy -D warnings`, `fmt --check`, an MSRV build, and `cargo deny`. What remains is consumer-side: wiring Beam and Beacon to depend on the engine and deleting their in-tree duplicates — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and [`docs/MIGRATION-CHECKLIST.md`](docs/MIGRATION-CHECKLIST.md).
 
 ## Crates
 
@@ -91,15 +91,24 @@ This is currently internal Ailuxis infrastructure. We'll open contribution paths
 
 ```bash
 cargo check --workspace          # fast type-check across all crates
-cargo build --workspace          # build every crate
+cargo build --workspace --lib    # build the LIBRARIES, as a consumer does
 cargo test  --workspace          # run every test, including doctests
 cargo fmt   --all                # format everything
 cargo clippy --workspace -- -D warnings
 cargo deny check                 # license / advisory / source gate
+cargo llvm-cov --workspace       # line coverage (CI floor: 85%)
 ```
 
-Note that `cargo test --workspace --all-targets` **skips doctests** — CI runs
-`--all-targets` and `--doc` as separate steps for that reason.
+Two `--all-targets` traps this repo has already been bitten by, both of which
+CI now guards separately:
+
+- `cargo test --workspace --all-targets` **skips doctests**. CI runs
+  `--all-targets` and `--doc` as separate steps.
+- `--all-targets` also builds test targets, which unifies
+  `[dev-dependencies]` features into the build. That can leave a library
+  that only compiles because a dev-dependency enabled a feature it uses —
+  green CI, unbuildable crate. CI therefore also runs
+  `cargo build --workspace --lib`.
 
 Minimum Rust version: **1.78** (set in `[workspace.package].rust-version`)
 and verified by a dedicated CI job, since both consumers pin to it.

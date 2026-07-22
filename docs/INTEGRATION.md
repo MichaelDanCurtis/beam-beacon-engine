@@ -143,6 +143,11 @@ These don't block consumer adoption but need answers before we hit `0.1.0`:
 3. **WebAssembly target.** Does Beacon ever need a wasm build of any
    engine crate? If yes, gate `bb-tool-bridge` features behind a `wasm`
    cfg flag.
-4. **Telemetry / metrics.** Where does the agent loop emit metrics from?
-   Probably a host-provided trait so each consumer can plug its own
-   sink (Beam → console; Beacon → enterprise telemetry; tests → in-memory).
+4. ~~**Telemetry / metrics.**~~ **DECIDED** — host-provided trait, as
+   expected. `bb-agent-loop` exposes `MetricsSink` + `MetricEvent`, wired
+   via the additive `AgentLoop::with_metrics`. Default is no sink, so the
+   uninstrumented path allocates nothing. Beam plugs in a console sink,
+   Beacon its enterprise telemetry, tests
+   `bb_agent_loop::testing::RecordingMetricsSink`. Settled before
+   adoption deliberately: adding an observability hook after consumers
+   pin the API would be a breaking change.

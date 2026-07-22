@@ -45,8 +45,43 @@ changes can land any time without a version bump.
     blocks and hosting agent turns; `KvStore` trait + `MemoryKvStore`;
     versioned `SessionSnapshot` persistence via `SessionHistory`;
     `IdentityContext` (Anonymous / SignedIn / Byok / ArcAttached).
+- Host-provided telemetry: `MetricsSink` / `MetricEvent` in
+  `bb-agent-loop`, wired via the additive `AgentLoop::with_metrics`
+  (resolves open decision #4 in `docs/INTEGRATION.md` before consumers
+  pin the API).
+- End-to-end golden transcript tests driving realistic shell sessions
+  through the whole seam (PTY bytes → parser → screen → blocks →
+  queryable output).
 - Workspace dependency table (serde, serde_json, thiserror, futures,
   tokio, unicode-width) and intra-workspace path entries.
+
+### Fixed
+
+Found by the end-to-end seam tests, which is precisely what they exist
+for — every one of these passed the per-crate unit suites:
+
+- **Command blocks depended on PTY read size.** `Parser::feed` returned
+  events only after consuming a chunk, so markers were all stamped with
+  a single post-feed cursor row. Fed in small chunks blocks were correct;
+  fed in one read — what a real PTY does — every block collapsed to a
+  zero-height range with empty text. `Parser::feed` now returns
+  `PositionedEvent`s stamped at emission, and block layout is identical
+  for every chunking from 1 byte to 64 KiB.
+- **`bb-agent-loop` did not build as a library.** `tokio::select!`
+  needed the `macros` feature, present only under `[dev-dependencies]`;
+  `--all-targets` builds unified it in, so all of CI was green while the
+  crate was unbuildable for a consumer.
+- **The alternate screen shadowed the scrollback timeline**, so
+  `block_text` returned a TUI's frame buffer while vim/htop was running.
+- **`resize` destroyed on-screen content**, silently blanking the
+  in-flight command's output on any window drag. It now preserves
+  content (no reflow) and keeps `cursor_absolute_row` invariant.
+- **A phantom empty block** was created by any first read that didn't
+  complete an OSC 133 sequence — including bash's own bracketed-paste
+  enable.
+- **Block pruning was unreachable** through `Session`, so the block list
+  grew unboundedly. `Session::prune_blocks` and
+  `Session::with_scrollback` added.
 - Initial scaffold: workspace, dual-license (MIT OR Apache-2.0), NOTICE
   with the no-upstream-Warp-code principle.
 - Architecture and integration docs under `docs/`.
@@ -55,9 +90,10 @@ changes can land any time without a version bump.
 ### Notes
 
 The engine-side implementation work (design + implementation for every
-crate) is complete and the whole workspace passes
-`cargo test / clippy -D warnings / fmt --check`. The remaining migration
-steps — Beam and Beacon adoption PRs, in-tree cleanup, and the `0.1.0`
-tag — happen in the consumer repos; see
+crate) is complete: 365 tests, 96% workspace line coverage, and eight CI
+gates — libs-only build, `--all-targets` tests, doctests, coverage floor,
+clippy `-D warnings`, fmt, MSRV 1.78, and `cargo deny`. The remaining
+migration steps — Beam and Beacon adoption PRs, in-tree cleanup, and the
+`0.1.0` tag — happen in the consumer repos; see
 [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and
 [`docs/MIGRATION-CHECKLIST.md`](docs/MIGRATION-CHECKLIST.md).
