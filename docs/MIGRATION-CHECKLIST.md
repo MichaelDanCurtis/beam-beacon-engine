@@ -9,7 +9,7 @@ go; each box is roughly one PR-sized chunk.
 - [x] Workspace + dual license (MIT OR Apache-2.0)
 - [x] 7 stub crates compile, clippy-clean, fmt-clean, test-clean
 - [x] CONTRIBUTING / CHANGELOG / SECURITY / ARCHITECTURE / INTEGRATION
-- [x] CI workflow (check + clippy + fmt + test)
+- [x] `script/check` runs every gate locally (no GitHub Actions)
 - [x] PR template + issue templates + CODEOWNERS
 
 ## Phase 1 — `bb-terminal-model` (first real crate)

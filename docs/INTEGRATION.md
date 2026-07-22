@@ -15,7 +15,7 @@ so we don't end up with three copies of the same logic.
   `beacon-mac`) has hand-coded analogues with substantial overlap. The
   agent loop and the provider abstraction are the most duplicated.
 - **`beam-beacon-engine`** (this repo) is **implemented**. All seven
-  crates have full implementations and test suites; CI enforces
+  crates have full implementations and test suites; `./script/check --full` enforces
   `cargo test` (including doctests), `clippy -D warnings`,
   `fmt --check`, an MSRV build, and `cargo deny`. **No consumer depends
   on the engine yet** — steps 3–5 of the recipe below are the remaining

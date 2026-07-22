@@ -134,14 +134,16 @@ existing suites at 94–97% line coverage:
 - Initial scaffold: workspace, dual-license (MIT OR Apache-2.0), NOTICE
   with the no-upstream-Warp-code principle.
 - Architecture and integration docs under `docs/`.
-- GitHub Actions CI (build + test + clippy + fmt) for `main` and PRs.
+- `script/check`, which runs every quality gate locally (this repo does
+  not use GitHub Actions).
 
 ### Notes
 
 The engine-side implementation work (design + implementation for every
-crate) is complete: 487 tests, 97% workspace line coverage, and eight CI
-gates — libs-only build, `--all-targets` tests, doctests, coverage floor,
-clippy `-D warnings`, fmt, MSRV 1.78, and `cargo deny`. The remaining
+crate) is complete: 505 tests, 97% workspace line coverage, and ten gates
+in `./script/check --full` — libs-only build (plus `--no-default-features`),
+`--all-targets` tests, doctests, coverage floor, clippy `-D warnings`, fmt,
+MSRV 1.78, `cargo deny`, and a release test run. The remaining
 migration steps — Beam and Beacon adoption PRs, in-tree cleanup, and the
 `0.1.0` tag — happen in the consumer repos; see
 [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and

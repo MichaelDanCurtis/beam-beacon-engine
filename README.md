@@ -26,7 +26,7 @@ Both products consume this repository as a workspace of small focused crates. Be
 
 ## Status
 
-> **Implemented, pre-adoption.** All seven crates below have full, freshly-written implementations backed by 487 tests at 97% line coverage, including end-to-end tests that drive realistic shell transcripts through the whole seam and adversarial probes for wide-character integrity, parser state-machine recovery, and agent cancellation. CI enforces eight gates: libs-only build, tests, doctests, a coverage floor, `clippy -D warnings`, `fmt --check`, an MSRV build, and `cargo deny`. What remains is consumer-side: wiring Beam and Beacon to depend on the engine and deleting their in-tree duplicates — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and [`docs/MIGRATION-CHECKLIST.md`](docs/MIGRATION-CHECKLIST.md).
+> **Implemented, pre-adoption.** All seven crates below have full, freshly-written implementations backed by 505 tests at 97% line coverage, including end-to-end tests that drive realistic shell transcripts through the whole seam and adversarial probes for wide-character integrity, parser state-machine recovery, and agent cancellation. There is no CI; `./script/check --full` runs the same ten gates locally: libs-only build (plus `--no-default-features`), tests, doctests, a coverage floor, `clippy -D warnings`, `fmt --check`, an MSRV 1.78 build, `cargo deny`, and a release test run. What remains is consumer-side: wiring Beam and Beacon to depend on the engine and deleting their in-tree duplicates — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and [`docs/MIGRATION-CHECKLIST.md`](docs/MIGRATION-CHECKLIST.md).
 
 ## Crates
 
@@ -96,19 +96,19 @@ cargo test  --workspace          # run every test, including doctests
 cargo fmt   --all                # format everything
 cargo clippy --workspace -- -D warnings
 cargo deny check                 # license / advisory / source gate
-cargo llvm-cov --workspace       # line coverage (CI floor: 85%)
+cargo llvm-cov --workspace       # line coverage (floor: 85%)
 ```
 
 Two `--all-targets` traps this repo has already been bitten by, both of which
-CI now guards separately:
+`script/check` guards each separately:
 
-- `cargo test --workspace --all-targets` **skips doctests**. CI runs
-  `--all-targets` and `--doc` as separate steps.
+- `cargo test --workspace --all-targets` **skips doctests**. The script runs
+  `--all-targets` and `--doc` as separate gates.
 - `--all-targets` also builds test targets, which unifies
   `[dev-dependencies]` features into the build. That can leave a library
   that only compiles because a dev-dependency enabled a feature it uses —
-  green CI, unbuildable crate. CI therefore also runs
+  everything green, unbuildable crate. The script therefore also runs
   `cargo build --workspace --lib`.
 
 Minimum Rust version: **1.78** (set in `[workspace.package].rust-version`)
-and verified by a dedicated CI job, since both consumers pin to it.
+and verified by `./script/check --full`, since both consumers pin to it.

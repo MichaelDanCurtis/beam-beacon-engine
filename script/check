@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Run every quality gate this repo cares about, locally.
+#
+# There is no CI: GitHub Actions is not used here, so this script IS the
+# gate. Run it before you push anything you care about.
+#
+#   ./script/check          # the fast gates (seconds)
+#   ./script/check --full   # everything, including coverage and MSRV
+#
+# Optional tools (skipped with a note if absent):
+#   cargo install cargo-deny cargo-llvm-cov
+#   rustup toolchain install 1.78
+
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+FULL=0
+[ "${1:-}" = "--full" ] && FULL=1
+
+fail=0
+run() { # run <label> <cmd...>
+  local label="$1"; shift
+  printf '%-34s' "$label"
+  if "$@" >/tmp/bb-check.$$ 2>&1; then
+    echo "ok"
+  else
+    echo "FAILED"
+    sed 's/^/    /' /tmp/bb-check.$$ | tail -25
+    fail=1
+  fi
+  rm -f /tmp/bb-check.$$
+}
+skip() { printf '%-34s%s\n' "$1" "skipped ($2)"; }
+
+# `--all-targets` also builds test targets, which unifies [dev-dependencies]
+# features into the build. That once hid a library that did not compile at
+# all, so build the libs the way a consumer does, on their own.
+run "build (libs only)"        cargo build --workspace --lib --locked
+run "build (no default feats)" cargo build --workspace --lib --no-default-features --locked
+run "test"                     cargo test --workspace --all-targets --locked
+# `--all-targets` EXCLUDES doctests, so they need their own run.
+run "doctests"                 cargo test --workspace --doc --locked
+run "clippy"                   cargo clippy --workspace --all-targets -- -D warnings
+run "fmt"                      cargo fmt --all -- --check
+
+if command -v cargo-deny >/dev/null 2>&1; then
+  run "supply chain (cargo deny)" cargo deny check
+else
+  skip "supply chain (cargo deny)" "cargo install cargo-deny"
+fi
+
+if [ "$FULL" = 1 ]; then
+  if rustup toolchain list 2>/dev/null | grep -q '^1\.78'; then
+    run "MSRV 1.78"             cargo +1.78 check --workspace --all-targets --locked
+  else
+    skip "MSRV 1.78" "rustup toolchain install 1.78"
+  fi
+  if command -v cargo-llvm-cov >/dev/null 2>&1; then
+    run "coverage (>= 85% lines)" cargo llvm-cov --workspace --all-features --locked --fail-under-lines 85
+  else
+    skip "coverage" "cargo install cargo-llvm-cov"
+  fi
+  run "tests (release)"        cargo test --workspace --release
+fi
+
+echo
+if [ "$fail" = 0 ]; then
+  echo "All gates passed."
+  [ "$FULL" = 0 ] && echo "(run with --full for MSRV, coverage and release tests)"
+else
+  echo "SOME GATES FAILED — see above."
+fi
+exit "$fail"

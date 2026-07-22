@@ -36,7 +36,7 @@ The engine is licensed `MIT OR Apache-2.0`. **No upstream-Warp code lives
 in this repository.** Hand-written provenance is enforced socially (in
 `CONTRIBUTING.md`) and reinforced in `NOTICE.md`. The *dependency* side is
 enforced mechanically: `deny.toml` restricts the graph to a permissive
-license allowlist and forbids git dependencies outright, so CI fails
+license allowlist and forbids git dependencies outright, so the check fails
 before a copyleft — or an arbitrary-repo — dependency can reach either
 consumer:
 
