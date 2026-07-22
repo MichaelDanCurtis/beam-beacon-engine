@@ -9,11 +9,13 @@ use bb_providers::{
 };
 use bb_tool_bridge::{ToolBridge, ToolContext};
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::time::Instant;
 
 use crate::cancel::CancellationToken;
 use crate::config::AgentConfig;
 use crate::conversation::Conversation;
 use crate::events::{AgentError, AgentEvent, TurnOutcome, UserInput};
+use crate::metrics::{MetricEvent, MetricsSink};
 use crate::provider::{Provider, ProviderCallError, Summarizer};
 
 /// Marker appended to partial assistant text pushed into the conversation
@@ -32,6 +34,7 @@ pub struct AgentLoop {
     tools: Arc<ToolBridge>,
     config: AgentConfig,
     summarizer: Option<Arc<dyn Summarizer>>,
+    metrics: Option<Arc<dyn MetricsSink>>,
 }
 
 impl std::fmt::Debug for AgentLoop {
@@ -41,6 +44,7 @@ impl std::fmt::Debug for AgentLoop {
             .field("tools", &self.tools)
             .field("config", &self.config)
             .field("summarizer", &self.summarizer.is_some())
+            .field("metrics", &self.metrics.is_some())
             .finish()
     }
 }
@@ -53,6 +57,7 @@ impl AgentLoop {
             tools,
             config,
             summarizer: None,
+            metrics: None,
         }
     }
 
@@ -64,9 +69,37 @@ impl AgentLoop {
         self
     }
 
+    /// Attach a [`MetricsSink`] that observes every [`MetricEvent`] of
+    /// every turn this loop runs.
+    ///
+    /// Purely additive: without it the loop behaves exactly as before and
+    /// records nothing — it does not even construct the events, so the
+    /// un-instrumented path costs one `Option` branch per instrumentation
+    /// site. See [`MetricEvent`] for what is recorded and when.
+    ///
+    /// The sink is called from the turn's hot path and must be cheap and
+    /// non-blocking; see [`MetricsSink`].
+    #[must_use]
+    pub fn with_metrics(mut self, sink: Arc<dyn MetricsSink>) -> Self {
+        self.metrics = Some(sink);
+        self
+    }
+
     /// The configuration this loop runs with.
     pub fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// Hand the configured sink, if any, to `f`.
+    ///
+    /// Taking a closure (rather than a built event) keeps event
+    /// construction — and any allocation it needs — out of the default
+    /// no-sink path entirely.
+    #[inline]
+    fn with_sink(&self, f: impl FnOnce(&dyn MetricsSink)) {
+        if let Some(sink) = &self.metrics {
+            f(sink.as_ref());
+        }
     }
 
     /// Run one user turn to completion.
@@ -96,6 +129,15 @@ impl AgentLoop {
     /// returns `Ok(TurnOutcome::Cancelled)`. A token cancelled before
     /// `run_turn` starts returns `Cancelled` without pushing the user
     /// message or calling the provider.
+    ///
+    /// # Telemetry
+    ///
+    /// When a [`MetricsSink`] is attached
+    /// ([`AgentLoop::with_metrics`]), the turn records a
+    /// [`MetricEvent::TurnStarted`], per-attempt provider events, one
+    /// [`MetricEvent::ToolDispatched`] per tool result, and exactly one
+    /// terminal event. All durations are measured with
+    /// [`tokio::time::Instant`], so they follow a paused test clock.
     pub async fn run_turn(
         &self,
         conversation: &mut Conversation,
@@ -104,12 +146,26 @@ impl AgentLoop {
         cancel: &CancellationToken,
         events_tx: UnboundedSender<AgentEvent>,
     ) -> Result<TurnOutcome, AgentError> {
+        let started = Instant::now();
+        let mut rounds: u32 = 0;
+
         if cancel.is_cancelled() {
             emit(&events_tx, AgentEvent::TurnCancelled);
+            self.with_sink(|sink| {
+                sink.record(&MetricEvent::TurnCancelled {
+                    duration: started.elapsed(),
+                    rounds,
+                });
+            });
             return Ok(TurnOutcome::Cancelled);
         }
 
         emit(&events_tx, AgentEvent::TurnStarted);
+        self.with_sink(|sink| {
+            sink.record(&MetricEvent::TurnStarted {
+                model: &self.config.model,
+            });
+        });
         conversation.push(match user_input {
             UserInput::Text(text) => ProviderMessage::User(text),
             UserInput::Multimodal(content) => ProviderMessage::UserMultimodal(content),
@@ -121,6 +177,12 @@ impl AgentLoop {
         for _round in 0..self.config.max_rounds {
             if let TrimOutcome::Cancelled = self.trim_context(conversation, cancel).await {
                 emit(&events_tx, AgentEvent::TurnCancelled);
+                self.with_sink(|sink| {
+                    sink.record(&MetricEvent::TurnCancelled {
+                        duration: started.elapsed(),
+                        rounds,
+                    });
+                });
                 return Ok(TurnOutcome::Cancelled);
             }
 
@@ -134,17 +196,34 @@ impl AgentLoop {
                 stream: true,
             };
 
-            let round = match self.call_with_retry(&request, cancel, &events_tx).await? {
-                CallOutcome::Cancelled { partial } => {
+            let round = match self.call_with_retry(&request, cancel, &events_tx).await {
+                Err(err) => {
+                    self.with_sink(|sink| {
+                        sink.record(&MetricEvent::TurnFailed {
+                            duration: started.elapsed(),
+                            rounds,
+                            error: &err.to_string(),
+                        });
+                    });
+                    return Err(err);
+                }
+                Ok(CallOutcome::Cancelled { partial }) => {
                     if let Some(assistant) = partial {
                         conversation.push(ProviderMessage::Assistant(assistant));
                     }
                     emit(&events_tx, AgentEvent::TurnCancelled);
+                    self.with_sink(|sink| {
+                        sink.record(&MetricEvent::TurnCancelled {
+                            duration: started.elapsed(),
+                            rounds,
+                        });
+                    });
                     return Ok(TurnOutcome::Cancelled);
                 }
-                CallOutcome::Round(round) => round,
+                Ok(CallOutcome::Round(round)) => round,
             };
 
+            rounds += 1;
             add_usage(&mut total_usage, round.usage);
             emit(
                 &events_tx,
@@ -167,6 +246,14 @@ impl AgentLoop {
                         stop_reason: round.stop_reason.clone(),
                     },
                 );
+                self.with_sink(|sink| {
+                    sink.record(&MetricEvent::TurnCompleted {
+                        duration: started.elapsed(),
+                        rounds,
+                        usage: total_usage,
+                        stop_reason: &round.stop_reason,
+                    });
+                });
                 return Ok(TurnOutcome::Completed {
                     stop_reason: round.stop_reason,
                     usage: total_usage,
@@ -183,15 +270,23 @@ impl AgentLoop {
                 );
             }
 
+            let dispatch_started = Instant::now();
             let results = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     conversation.push(ProviderMessage::ToolResults(cancelled_results(&tool_calls)));
                     emit(&events_tx, AgentEvent::TurnCancelled);
+                    self.with_sink(|sink| {
+                        sink.record(&MetricEvent::TurnCancelled {
+                            duration: started.elapsed(),
+                            rounds,
+                        });
+                    });
                     return Ok(TurnOutcome::Cancelled);
                 }
                 results = self.tools.dispatch_all(&tool_calls, tool_ctx) => results,
             };
+            let dispatch_duration = dispatch_started.elapsed();
 
             for result in &results {
                 emit(
@@ -202,22 +297,36 @@ impl AgentLoop {
                         is_error: result.is_error,
                     },
                 );
+                self.with_sink(|sink| {
+                    sink.record(&MetricEvent::ToolDispatched {
+                        name: &result.name,
+                        duration: dispatch_duration,
+                        is_error: result.is_error,
+                    });
+                });
             }
             conversation.push(ProviderMessage::ToolResults(results));
         }
 
         let err = AgentError::RoundLimitExceeded(self.config.max_rounds);
-        emit(
-            &events_tx,
-            AgentEvent::TurnFailed {
-                error: err.to_string(),
-            },
-        );
+        let error = err.to_string();
+        self.with_sink(|sink| {
+            sink.record(&MetricEvent::TurnFailed {
+                duration: started.elapsed(),
+                rounds,
+                error: &error,
+            });
+        });
+        emit(&events_tx, AgentEvent::TurnFailed { error });
         Err(err)
     }
 
     /// Trim the conversation to the context budget, invoking the
     /// summarizer (cancellably) when messages were evicted.
+    ///
+    /// Records [`MetricEvent::ContextTrimmed`] whenever eviction happened —
+    /// including when the summarizer hook was cancelled, in which case
+    /// `summarized` is `false`.
     async fn trim_context(
         &self,
         conversation: &mut Conversation,
@@ -227,16 +336,33 @@ impl AgentLoop {
         if evicted.is_empty() {
             return TrimOutcome::Done;
         }
+        let evicted_messages = evicted.len();
+        let mut summarized = false;
         if let Some(summarizer) = &self.summarizer {
             let summary = tokio::select! {
                 biased;
-                () = cancel.cancelled() => return TrimOutcome::Cancelled,
+                () = cancel.cancelled() => {
+                    self.with_sink(|sink| {
+                        sink.record(&MetricEvent::ContextTrimmed {
+                            evicted_messages,
+                            summarized: false,
+                        });
+                    });
+                    return TrimOutcome::Cancelled;
+                }
                 summary = summarizer.summarize(&evicted) => summary,
             };
             if let Some(text) = summary {
                 conversation.insert_summary(&text);
+                summarized = true;
             }
         }
+        self.with_sink(|sink| {
+            sink.record(&MetricEvent::ContextTrimmed {
+                evicted_messages,
+                summarized,
+            });
+        });
         TrimOutcome::Done
     }
 
@@ -245,6 +371,12 @@ impl AgentLoop {
     /// Emits `Retrying` before each backoff sleep and `TurnFailed` before
     /// returning `Err`. Accumulated streaming state is reset per attempt;
     /// only the successful attempt's content becomes the round result.
+    ///
+    /// Records [`MetricEvent::ProviderCallCompleted`] /
+    /// [`MetricEvent::ProviderCallFailed`] per attempt, and
+    /// [`MetricEvent::RetryScheduled`] before each backoff sleep. The
+    /// turn-terminal [`MetricEvent::TurnFailed`] is recorded by the caller,
+    /// which knows the turn's duration and round count.
     async fn call_with_retry(
         &self,
         request: &ProviderRequest,
@@ -254,12 +386,32 @@ impl AgentLoop {
         let max_attempts = self.config.retry.max_attempts.max(1);
         let mut attempt: u32 = 1;
         loop {
+            let attempt_started = Instant::now();
             match self.call_once(request, cancel, events_tx).await {
                 AttemptOutcome::Cancelled { partial } => {
                     return Ok(CallOutcome::Cancelled { partial });
                 }
-                AttemptOutcome::Complete(round) => return Ok(CallOutcome::Round(round)),
+                AttemptOutcome::Complete(round) => {
+                    self.with_sink(|sink| {
+                        sink.record(&MetricEvent::ProviderCallCompleted {
+                            model: &request.model,
+                            attempt,
+                            duration: attempt_started.elapsed(),
+                            usage: round.usage,
+                            stop_reason: &round.stop_reason,
+                        });
+                    });
+                    return Ok(CallOutcome::Round(round));
+                }
                 AttemptOutcome::Failed(ProviderCallError::Permanent(detail)) => {
+                    self.with_sink(|sink| {
+                        sink.record(&MetricEvent::ProviderCallFailed {
+                            model: &request.model,
+                            attempt,
+                            transient: false,
+                            error: &detail,
+                        });
+                    });
                     let err = AgentError::Provider(detail);
                     emit(
                         events_tx,
@@ -270,6 +422,14 @@ impl AgentLoop {
                     return Err(err);
                 }
                 AttemptOutcome::Failed(ProviderCallError::Transient(detail)) => {
+                    self.with_sink(|sink| {
+                        sink.record(&MetricEvent::ProviderCallFailed {
+                            model: &request.model,
+                            attempt,
+                            transient: true,
+                            error: &detail,
+                        });
+                    });
                     if attempt >= max_attempts {
                         let err = AgentError::Provider(format!(
                             "transient error persisted after {attempt} attempts: {detail}"
@@ -291,6 +451,13 @@ impl AgentLoop {
                             error: detail,
                         },
                     );
+                    self.with_sink(|sink| {
+                        sink.record(&MetricEvent::RetryScheduled {
+                            model: &request.model,
+                            attempt,
+                            backoff,
+                        });
+                    });
                     tokio::select! {
                         biased;
                         () = cancel.cancelled() => {

@@ -23,6 +23,10 @@
 //! - **Conversation state** — [`Conversation`] history with
 //!   context-window trimming ([`ContextPolicy`]) and an optional
 //!   [`Summarizer`] hook.
+//! - **Telemetry** — structured [`MetricEvent`]s handed to an optional
+//!   host-provided [`MetricsSink`] ([`AgentLoop::with_metrics`]), so each
+//!   consumer plugs its own backend. A loop without a sink records
+//!   nothing.
 //!
 //! # Example wiring
 //!
@@ -66,11 +70,14 @@ mod cancel;
 mod config;
 mod conversation;
 mod events;
+mod metrics;
 mod provider;
+pub mod testing;
 
 pub use agent::{AgentLoop, CANCELLATION_MARKER};
 pub use cancel::CancellationToken;
 pub use config::{AgentConfig, ContextPolicy, RetryPolicy};
 pub use conversation::Conversation;
 pub use events::{AgentError, AgentEvent, TurnOutcome, UserInput};
+pub use metrics::{MetricEvent, MetricsSink, NoopMetricsSink};
 pub use provider::{Provider, ProviderCallError, Summarizer};
