@@ -17,7 +17,12 @@ bb-tool-bridge.workspace = true
 futures.workspace        = true
 serde_json.workspace     = true
 thiserror.workspace      = true
-tokio = { workspace = true, features = ["sync", "time"] }
+# `macros` is required by the `tokio::select!` calls in src/agent.rs that
+# implement cancellation. It must be a NORMAL dependency: listing it only under
+# [dev-dependencies] still compiles `cargo test`/`--all-targets` (dev-dep
+# features unify into that build) while leaving the library itself broken for
+# any real consumer. See the `build` job in CI, which checks lib-only.
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "sync", "test-util"] }
