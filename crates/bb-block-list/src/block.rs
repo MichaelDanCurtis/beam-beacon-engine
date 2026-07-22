@@ -68,9 +68,6 @@ pub struct Block {
     pub(crate) start_row: usize,
     /// Exclusive end row; `None` while the block is still growing.
     pub(crate) end: Option<usize>,
-    /// Highest absolute row observed while the block is open (provisional
-    /// extent for a still-growing block).
-    pub(crate) last_row: usize,
     pub(crate) command: Option<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) exit_code: Option<i32>,
@@ -83,7 +80,6 @@ impl Block {
             lifecycle,
             start_row,
             end: None,
-            last_row: start_row,
             command: None,
             cwd: None,
             exit_code: None,

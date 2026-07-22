@@ -148,7 +148,27 @@ implementations behind it. The core abstraction is a `ProviderMessage`
 / `ProviderEvent` pair whose multimodal content (text + images + tool
 calls + tool results) is encoded into each provider's wire format by a
 per-provider encoder. The same `ProviderMessage` round-trips through any
-provider without lossy conversion. Encoders covered:
+provider without lossy conversion.
+
+Two contracts a host **must** honor:
+
+- **`StreamDecoder::finish()` must be called at end of stream.** Several
+  providers only imply the end of a turn (a server may omit
+  `data: [DONE]`, or a final NDJSON line may have no trailing newline).
+  `finish()` flushes the residual frame and synthesizes the terminal
+  event. Skipping it silently discards a fully-received answer.
+- **Transport failures must be reported as `Err`.** `Provider::call`
+  returning `Ok(())` asserts the stream ended *cleanly*. The agent loop
+  relies on that distinction: a clean stream with no explicit stop
+  reason completes the turn, while an `Err` never has its partial
+  content salvaged.
+
+Thinking text is carried as a `ThinkingBlock` (text plus an opaque
+provider signature) rather than a bare string, because Anthropic
+requires the signature when a thinking block is replayed in a later
+assistant turn.
+
+Encoders covered:
 
 - Anthropic Messages API (image blocks, thinking, prompt caching)
 - OpenAI-compatible Chat Completions and Responses APIs (`image_url`

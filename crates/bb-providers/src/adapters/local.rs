@@ -7,6 +7,11 @@
 //! [`ProviderConfig::api_key`] is usually `None` — the underlying encoder
 //! already omits the `Authorization` header in that case.
 //!
+//! These servers are the ones most likely to end a stream without
+//! `data: [DONE]` (llama.cpp's server never sends it), so calling
+//! [`StreamDecoder::finish`] at end-of-stream is not optional here — see
+//! the [`OpenAiCompatAdapter`] notes.
+//!
 //! [`ProviderConfig::api_key`]: crate::types::ProviderConfig::api_key
 
 use crate::adapters::{CompletedResponse, OpenAiCompatAdapter, ProviderAdapter, StreamDecoder};
@@ -46,7 +51,8 @@ impl ProviderAdapter for LocalOpenAiAdapter {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::test_support::{config, full_conversation};
+    use crate::test_support::{config, decode_stream, full_conversation};
+    use crate::types::{ProviderEvent, StopReason};
 
     #[test]
     fn name_is_local_openai() {
@@ -63,6 +69,24 @@ mod tests {
             .unwrap();
         assert_eq!(spec.url, "http://localhost:1234/v1/chat/completions");
         assert!(spec.headers.iter().all(|(name, _)| name != "authorization"));
+    }
+
+    #[test]
+    fn stream_without_done_marker_still_finishes_the_turn() {
+        // llama.cpp's server never sends `data: [DONE]`, and these local
+        // endpoints are exactly this adapter's audience.
+        let bytes = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer is 42.\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        assert_eq!(
+            decode_stream(&LocalOpenAiAdapter, bytes.as_bytes()),
+            vec![
+                ProviderEvent::MessageStart,
+                ProviderEvent::TextDelta("The answer is 42.".to_owned()),
+                ProviderEvent::Finished(StopReason::EndTurn),
+            ]
+        );
     }
 
     #[test]

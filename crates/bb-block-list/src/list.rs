@@ -90,7 +90,6 @@ impl BlockList {
                     ) =>
                 {
                     open.lifecycle = BlockLifecycle::Composing;
-                    open.last_row = open.last_row.max(cursor_abs_row);
                 }
                 Some(open) => {
                     // B after C/D without a fresh prompt: start a new block.
@@ -102,7 +101,6 @@ impl BlockList {
             PromptMarker::CommandExecuted => match self.open_block_mut() {
                 Some(open) if open.lifecycle != BlockLifecycle::Finished => {
                     open.lifecycle = BlockLifecycle::Running;
-                    open.last_row = open.last_row.max(cursor_abs_row);
                 }
                 Some(open) => {
                     // C after D without a fresh prompt: start a new block.
@@ -115,7 +113,6 @@ impl BlockList {
                 Some(open) => {
                     open.lifecycle = BlockLifecycle::Finished;
                     open.exit_code = exit_code;
-                    open.last_row = open.last_row.max(cursor_abs_row);
                 }
                 None => {
                     // D without A: record what we can.
@@ -220,10 +217,6 @@ impl BlockList {
     pub fn observe_row(&mut self, screen: &Screen) {
         if self.blocks.is_empty() && !self.saw_marker && Self::has_output(screen) {
             self.push_block(0, BlockLifecycle::Running);
-        }
-        let cursor_abs_row = screen.cursor_absolute_row();
-        if let Some(open) = self.open_block_mut() {
-            open.last_row = open.last_row.max(cursor_abs_row);
         }
     }
 
@@ -406,18 +399,21 @@ impl BlockList {
 
     fn collect_text(block: &Block, screen: &Screen) -> String {
         let (start, end) = Self::text_range(block, screen);
-        let mut out = String::new();
-        let mut first = true;
+        let mut lines: Vec<String> = Vec::new();
         for abs_row in start..end {
             if let Some(text) = screen.row_text(abs_row) {
-                if !first {
-                    out.push('\n');
-                }
-                out.push_str(&text);
-                first = false;
+                lines.push(text);
             }
         }
-        out
+        // An OPEN block extends to the screen's last addressable row, so it
+        // would otherwise pick up one empty line per not-yet-written row —
+        // roughly a full screen of blank lines for a freshly started
+        // command. Those rows hold no output, so drop the trailing blank
+        // run. Interior blank lines are real output and are preserved.
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
     }
 
     fn index_of(&self, id: BlockId) -> Option<usize> {
@@ -951,13 +947,57 @@ mod tests {
         let text = bl.block_text(&screen, first_id).unwrap();
         assert_eq!(text, "$ echo Hello\nHello world");
 
-        // Open block: extends to the screen's last addressable row; the
-        // trailing blank grid rows contribute empty lines.
+        // An open block spans to the screen's last addressable row, but the
+        // not-yet-written rows must not show up as trailing empty lines.
         let last_id = bl.last().unwrap().id();
         let text = bl.block_text(&screen, last_id).unwrap();
-        assert!(text.starts_with("$ rg needle\nsrc/lib.rs: needle found"));
+        assert_eq!(text, "$ rg needle\nsrc/lib.rs: needle found");
 
         assert!(bl.block_text(&screen, BlockId(42)).is_none());
+    }
+
+    #[test]
+    fn open_block_text_has_no_trailing_blank_lines() {
+        // A freshly started command on a tall screen: the open block reaches
+        // the last row, so every unwritten row below the output would
+        // otherwise be joined in as an empty line (a full screen of
+        // whitespace for a host's "copy output" action).
+        let mut screen = Screen::new(24, 80);
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::PromptStart, screen.cursor_absolute_row());
+        bl.on_marker(PromptMarker::CommandExecuted, screen.cursor_absolute_row());
+        for ch in "building".chars() {
+            screen.print(ch);
+        }
+        screen.linefeed();
+        screen.carriage_return();
+        bl.observe_row(&screen);
+
+        let id = bl.latest().unwrap().id();
+        let text = bl.block_text(&screen, id).unwrap();
+        assert_eq!(text, "building");
+        assert!(!text.ends_with('\n'));
+    }
+
+    #[test]
+    fn interior_blank_lines_are_preserved() {
+        // Only the TRAILING blank run is dropped: a blank line between two
+        // lines of real output is real output.
+        let mut screen = Screen::new(24, 80);
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::PromptStart, screen.cursor_absolute_row());
+        bl.on_marker(PromptMarker::CommandExecuted, screen.cursor_absolute_row());
+        for line in ["first", "", "third"] {
+            for ch in line.chars() {
+                screen.print(ch);
+            }
+            screen.linefeed();
+            screen.carriage_return();
+        }
+        bl.observe_row(&screen);
+
+        let id = bl.latest().unwrap().id();
+        assert_eq!(bl.block_text(&screen, id).unwrap(), "first\n\nthird");
     }
 
     #[test]

@@ -9,22 +9,39 @@
 //! proxies. Deviations forced by the wire format:
 //!
 //! - Assistant `thinking` has no standard Chat Completions field and is
-//!   **dropped on encode**. On decode, a `reasoning_content` (or
-//!   `reasoning`) field — the de-facto extension used by DeepSeek-style
-//!   servers — is surfaced as thinking.
+//!   **dropped on encode** (signature included). On decode, a
+//!   `reasoning_content` (or `reasoning`) field — the de-facto extension
+//!   used by DeepSeek-style servers — is surfaced as thinking, without a
+//!   signature.
 //! - `role:"tool"` messages cannot carry images, so images attached to a
 //!   [`ToolResult`] are re-sent in a follow-up `role:"user"` message with
 //!   an explanatory note.
+//! - `role:"tool"` messages have **no error flag**, so a failed
+//!   [`ToolResult`] (`is_error`) has its content prefixed with
+//!   [`TOOL_ERROR_PREFIX`](crate::TOOL_ERROR_PREFIX). Without it every failed tool would reach the
+//!   model as a structurally successful result.
+//! - Messages carrying no content are omitted, so the neutral model
+//!   behaves identically here and on Anthropic (which rejects them); a
+//!   request whose messages are all empty is an encode error.
+//! - `data: [DONE]` is optional in practice (llama.cpp's server and some
+//!   vLLM/LM Studio/proxy configs omit it), so the decoder synthesizes
+//!   [`ProviderEvent::Finished`] from
+//!   [`StreamDecoder::finish`](crate::StreamDecoder::finish) when the
+//!   terminator never arrives.
 
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::adapters::{data_url, join_url, CompletedResponse, ProviderAdapter, StreamDecoder};
+use crate::adapters::{
+    data_url, empty_request_error, is_empty_message, join_url, tool_arguments_or_empty,
+    tool_result_content, unknown_stop_reason, CompletedResponse, ProviderAdapter, StreamDecoder,
+};
 use crate::sse::SseFramer;
 use crate::types::{
     AssistantMessage, HttpRequestSpec, ProviderConfig, ProviderError, ProviderEvent,
-    ProviderMessage, ProviderRequest, StopReason, TokenUsage, ToolCall, ToolResult, UserContent,
+    ProviderMessage, ProviderRequest, StopReason, ThinkingBlock, TokenUsage, ToolCall, ToolResult,
+    UserContent,
 };
 
 const PROVIDER: &str = "openai-compat";
@@ -50,18 +67,21 @@ fn map_finish_reason(raw: Option<&str>) -> StopReason {
 
 /// Parse a tool-call `arguments` value: servers send a JSON-encoded string,
 /// but some compatible servers inline the object directly.
+///
+/// An absent payload, and the `""` OpenAI commonly sends for a
+/// zero-argument tool, both normalize to an empty JSON object — see
+/// [`tool_arguments_or_empty`].
 fn parse_arguments(raw: Option<&Value>) -> Result<Value, ProviderError> {
     match raw {
-        None => Ok(Value::Null),
         Some(Value::String(text)) => {
             if text.trim().is_empty() {
-                return Ok(Value::Null);
+                return Ok(tool_arguments_or_empty(None));
             }
             serde_json::from_str(text).map_err(|err| {
                 ProviderError::decode(PROVIDER, format!("invalid tool-call arguments JSON: {err}"))
             })
         }
-        Some(other) => Ok(other.clone()),
+        other => Ok(tool_arguments_or_empty(other)),
     }
 }
 
@@ -70,7 +90,8 @@ fn encode_tool_results(results: &[ToolResult], out: &mut Vec<Value>) {
         out.push(json!({
             "role": "tool",
             "tool_call_id": result.call_id,
-            "content": result.content,
+            // No error flag on this wire format: mark failures in-band.
+            "content": tool_result_content(result),
         }));
     }
     let images: Vec<&crate::types::MessageImage> =
@@ -118,12 +139,14 @@ fn encode_message(message: &ProviderMessage, out: &mut Vec<Value>) -> Result<(),
                     .tool_calls
                     .iter()
                     .map(|call| {
-                        let arguments = serde_json::to_string(&call.arguments).map_err(|err| {
-                            ProviderError::encode(
-                                PROVIDER,
-                                format!("tool-call arguments not serializable: {err}"),
-                            )
-                        })?;
+                        let arguments =
+                            serde_json::to_string(&tool_arguments_or_empty(Some(&call.arguments)))
+                                .map_err(|err| {
+                                    ProviderError::encode(
+                                        PROVIDER,
+                                        format!("tool-call arguments not serializable: {err}"),
+                                    )
+                                })?;
                         Ok(json!({
                             "id": call.id,
                             "type": "function",
@@ -152,10 +175,18 @@ impl ProviderAdapter for OpenAiCompatAdapter {
     ) -> Result<HttpRequestSpec, ProviderError> {
         let mut messages = Vec::new();
         if let Some(system) = &request.system {
-            messages.push(json!({"role": "system", "content": system}));
+            if !system.is_empty() {
+                messages.push(json!({"role": "system", "content": system}));
+            }
         }
         for message in &request.messages {
+            if is_empty_message(message) {
+                continue;
+            }
             encode_message(message, &mut messages)?;
+        }
+        if messages.is_empty() {
+            return Err(empty_request_error(PROVIDER));
         }
 
         let mut body = json!({
@@ -218,11 +249,12 @@ impl ProviderAdapter for OpenAiCompatAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
+        // No Chat Completions server issues a thinking signature.
         let thinking = message
             .get("reasoning_content")
             .or_else(|| message.get("reasoning"))
             .and_then(Value::as_str)
-            .map(str::to_owned);
+            .map(ThinkingBlock::new);
 
         let mut tool_calls = Vec::new();
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -274,14 +306,21 @@ impl ProviderAdapter for OpenAiCompatAdapter {
     }
 }
 
-/// Streaming decoder for Chat Completions SSE (`data:` JSON chunks with a
-/// terminating `data: [DONE]`).
+/// Streaming decoder for Chat Completions SSE (`data:` JSON chunks,
+/// usually — but not always — with a terminating `data: [DONE]`).
 #[derive(Debug)]
 struct OpenAiStreamDecoder {
     framer: SseFramer,
     started: bool,
     open_tool_indices: BTreeSet<usize>,
     stop_reason: Option<StopReason>,
+    /// Set once a `finish_reason` arrived. Every tool call is closed at
+    /// that point, so later tool deltas are ignored rather than reopening
+    /// an index as a brand-new, name-less call.
+    finish_seen: bool,
+    /// Set once `Finished` was emitted, so `[DONE]` followed by
+    /// [`StreamDecoder::finish`] cannot produce two.
+    finished: bool,
 }
 
 impl OpenAiStreamDecoder {
@@ -291,7 +330,45 @@ impl OpenAiStreamDecoder {
             started: false,
             open_tool_indices: BTreeSet::new(),
             stop_reason: None,
+            finish_seen: false,
+            finished: false,
         }
+    }
+
+    /// Close any still-open tool calls and emit `Finished` once, carrying
+    /// the `finish_reason` seen so far.
+    fn emit_finished(&mut self, out: &mut Vec<ProviderEvent>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        while let Some(index) = self.open_tool_indices.pop_first() {
+            out.push(ProviderEvent::ToolCallEnd { index });
+        }
+        let reason = self.stop_reason.take().unwrap_or_else(unknown_stop_reason);
+        out.push(ProviderEvent::Finished(reason));
+    }
+
+    fn decode_frames(
+        &mut self,
+        frames: Vec<crate::sse::SseEvent>,
+        out: &mut Vec<ProviderEvent>,
+    ) -> Result<(), ProviderError> {
+        for frame in frames {
+            let payload = frame.data.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                self.emit_finished(out);
+                continue;
+            }
+            let data: Value = serde_json::from_str(payload).map_err(|err| {
+                ProviderError::decode(PROVIDER, format!("invalid JSON in SSE data: {err}"))
+            })?;
+            self.handle_chunk(&data, out);
+        }
+        Ok(())
     }
 
     fn handle_chunk(&mut self, data: &Value, out: &mut Vec<ProviderEvent>) {
@@ -352,11 +429,18 @@ impl OpenAiStreamDecoder {
             while let Some(index) = self.open_tool_indices.pop_first() {
                 out.push(ProviderEvent::ToolCallEnd { index });
             }
+            self.finish_seen = true;
             self.stop_reason = Some(map_finish_reason(Some(reason)));
         }
     }
 
     fn handle_tool_delta(&mut self, call: &Value, out: &mut Vec<ProviderEvent>) {
+        if self.finish_seen {
+            // The call at this index was closed by `finish_reason`.
+            // Re-opening it would fabricate a second, name-less tool call
+            // and leave the real one with truncated arguments.
+            return;
+        }
         let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         if !self.open_tool_indices.contains(&index) {
             self.open_tool_indices.insert(index);
@@ -387,27 +471,18 @@ impl OpenAiStreamDecoder {
 impl StreamDecoder for OpenAiStreamDecoder {
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<ProviderEvent>, ProviderError> {
         let mut out = Vec::new();
-        for frame in self.framer.feed(chunk)? {
-            let payload = frame.data.trim();
-            if payload.is_empty() {
-                continue;
-            }
-            if payload == "[DONE]" {
-                while let Some(index) = self.open_tool_indices.pop_first() {
-                    out.push(ProviderEvent::ToolCallEnd { index });
-                }
-                let reason = self
-                    .stop_reason
-                    .take()
-                    .unwrap_or(StopReason::Other("unknown".to_owned()));
-                out.push(ProviderEvent::Finished(reason));
-                continue;
-            }
-            let data: Value = serde_json::from_str(payload).map_err(|err| {
-                ProviderError::decode(PROVIDER, format!("invalid JSON in SSE data: {err}"))
-            })?;
-            self.handle_chunk(&data, &mut out);
-        }
+        let frames = self.framer.feed(chunk)?;
+        self.decode_frames(frames, &mut out)?;
+        Ok(out)
+    }
+
+    fn finish(&mut self) -> Result<Vec<ProviderEvent>, ProviderError> {
+        let mut out = Vec::new();
+        // Flush a final frame that never got its blank line, then
+        // synthesize `Finished` for servers that omit `data: [DONE]`.
+        let frames = self.framer.finish()?;
+        self.decode_frames(frames, &mut out)?;
+        self.emit_finished(&mut out);
         Ok(out)
     }
 }
@@ -416,7 +491,10 @@ impl StreamDecoder for OpenAiStreamDecoder {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::test_support::{assert_split_stable, config, full_conversation, image};
+    use crate::test_support::{
+        assert_split_stable, assert_terminator_optional, config, decode_stream, full_conversation,
+        image,
+    };
 
     #[test]
     fn encode_simple_text_conversation() {
@@ -699,5 +777,268 @@ mod tests {
             let events = decoder.feed(bytes.as_bytes()).unwrap();
             assert_eq!(events.last(), Some(&ProviderEvent::Finished(mapped)));
         }
+    }
+
+    /// The same stream as [`tool_stream`] from a server that never sends
+    /// `data: [DONE]` — llama.cpp's server, and some vLLM / LM Studio /
+    /// proxy configurations.
+    fn tool_stream_without_done() -> Vec<u8> {
+        let full = String::from_utf8(tool_stream()).unwrap();
+        full.replace("data: [DONE]\n\n", "").into_bytes()
+    }
+
+    #[test]
+    fn stream_without_done_marker_decodes_identically() {
+        assert_terminator_optional(
+            &OpenAiCompatAdapter,
+            &tool_stream(),
+            &tool_stream_without_done(),
+        );
+    }
+
+    #[test]
+    fn stream_without_done_marker_still_finishes_the_turn() {
+        // The regression: the full answer streamed, then the whole
+        // assistant message was discarded because `Finished` never came.
+        let bytes = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer is 42.\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        assert_eq!(
+            decode_stream(&OpenAiCompatAdapter, bytes.as_bytes()),
+            vec![
+                ProviderEvent::MessageStart,
+                ProviderEvent::TextDelta("The answer is 42.".to_owned()),
+                ProviderEvent::Finished(StopReason::EndTurn),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_cut_before_any_finish_reason_finishes_as_unknown() {
+        let bytes = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        assert_eq!(
+            decode_stream(&OpenAiCompatAdapter, bytes.as_bytes()).last(),
+            Some(&ProviderEvent::Finished(StopReason::Other(
+                "unknown".to_owned()
+            )))
+        );
+    }
+
+    #[test]
+    fn stream_flushes_a_frame_with_no_trailing_blank_line() {
+        let mut decoder = OpenAiCompatAdapter.stream_decoder();
+        assert!(decoder
+            .feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tail\"}}]}\n")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            decoder.finish().unwrap(),
+            vec![
+                ProviderEvent::MessageStart,
+                ProviderEvent::TextDelta("tail".to_owned()),
+                ProviderEvent::Finished(StopReason::Other("unknown".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn finish_reports_a_stream_cut_mid_json() {
+        // Half a frame is not a completed turn; the host needs to know the
+        // response was truncated.
+        let mut decoder = OpenAiCompatAdapter.stream_decoder();
+        decoder
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"par")
+            .unwrap();
+        assert!(matches!(
+            decoder.finish().unwrap_err(),
+            ProviderError::Decode {
+                provider: "openai-compat",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn finish_after_done_marker_emits_nothing_more() {
+        let mut decoder = OpenAiCompatAdapter.stream_decoder();
+        let events = decoder.feed(&tool_stream()).unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&ProviderEvent::Finished(StopReason::ToolUse))
+        );
+        assert!(decoder.finish().unwrap().is_empty());
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_ignores_tool_deltas_after_finish_reason() {
+        // A trailing argument delta at an index `finish_reason` already
+        // closed must not reopen it as a second, name-less tool call.
+        let bytes = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_real\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"stray\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = decode_stream(&OpenAiCompatAdapter, bytes.as_bytes());
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::MessageStart,
+                ProviderEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_real".to_owned(),
+                    name: "shell".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    json_fragment: "{}".to_owned(),
+                },
+                ProviderEvent::ToolCallEnd { index: 0 },
+                ProviderEvent::Finished(StopReason::ToolUse),
+            ]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallStart { name, .. } if name.is_empty())),
+            "a name-less tool call was fabricated: {events:?}"
+        );
+    }
+
+    #[test]
+    fn encode_marks_failed_tool_results_in_content() {
+        // This wire format has no `is_error`, so the failure has to be
+        // legible in the content or the model reads it as a success.
+        let request = ProviderRequest {
+            model: "gpt-4o".to_owned(),
+            system: None,
+            messages: vec![ProviderMessage::ToolResults(vec![
+                ToolResult {
+                    call_id: "call_1".to_owned(),
+                    name: "shell".to_owned(),
+                    content: "exit status 1".to_owned(),
+                    images: vec![],
+                    is_error: true,
+                },
+                ToolResult {
+                    call_id: "call_2".to_owned(),
+                    name: "shell".to_owned(),
+                    content: "ok".to_owned(),
+                    images: vec![],
+                    is_error: false,
+                },
+            ])],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+        };
+        let spec = OpenAiCompatAdapter
+            .encode_request(&config("https://api.openai.com/v1", None), &request)
+            .unwrap();
+        assert_eq!(
+            spec.body["messages"],
+            json!([
+                {"role": "tool", "tool_call_id": "call_1",
+                 "content": "Error: exit status 1"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "ok"},
+            ])
+        );
+        assert!(spec.body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(crate::TOOL_ERROR_PREFIX));
+    }
+
+    #[test]
+    fn decode_absent_or_empty_arguments_becomes_empty_object() {
+        for raw in [json!(""), json!("   "), Value::Null] {
+            let mut function = json!({"name": "now"});
+            if !raw.is_null() {
+                function["arguments"] = raw.clone();
+            }
+            let body = json!({"choices": [{
+                "message": {"tool_calls": [{"id": "c1", "type": "function",
+                                            "function": function}]},
+                "finish_reason": "tool_calls",
+            }]});
+            let response = OpenAiCompatAdapter.decode_response(&body).unwrap();
+            assert_eq!(
+                response.message.tool_calls[0].arguments,
+                json!({}),
+                "raw arguments {raw:?} should normalize to an empty object"
+            );
+
+            // ...and re-encoding must not put `"arguments": "null"` back on
+            // the wire.
+            let spec = OpenAiCompatAdapter
+                .encode_request(
+                    &config("https://api.openai.com/v1", None),
+                    &ProviderRequest {
+                        model: "gpt-4o".to_owned(),
+                        system: None,
+                        messages: vec![ProviderMessage::Assistant(response.message)],
+                        tools: vec![],
+                        max_tokens: None,
+                        temperature: None,
+                        stream: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                spec.body["messages"][0]["tool_calls"][0]["function"]["arguments"],
+                json!("{}")
+            );
+        }
+    }
+
+    #[test]
+    fn encode_omits_empty_messages() {
+        let request = ProviderRequest {
+            model: "gpt-4o".to_owned(),
+            system: Some(String::new()),
+            messages: vec![
+                ProviderMessage::User(String::new()),
+                ProviderMessage::UserMultimodal(vec![]),
+                ProviderMessage::ToolResults(vec![]),
+                ProviderMessage::Assistant(AssistantMessage::default()),
+                ProviderMessage::User("real".to_owned()),
+            ],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+        };
+        let spec = OpenAiCompatAdapter
+            .encode_request(&config("https://api.openai.com/v1", None), &request)
+            .unwrap();
+        assert_eq!(
+            spec.body["messages"],
+            json!([{"role": "user", "content": "real"}])
+        );
+    }
+
+    #[test]
+    fn encode_rejects_a_request_with_nothing_to_send() {
+        let request = ProviderRequest {
+            model: "gpt-4o".to_owned(),
+            system: None,
+            messages: vec![ProviderMessage::User(String::new())],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+        };
+        assert!(matches!(
+            OpenAiCompatAdapter
+                .encode_request(&config("https://api.openai.com/v1", None), &request)
+                .unwrap_err(),
+            ProviderError::Encode {
+                provider: "openai-compat",
+                ..
+            }
+        ));
     }
 }

@@ -124,18 +124,26 @@ impl Session {
     /// [`SessionHistory::restore`](crate::SessionHistory::restore)). The
     /// screen and block list start fresh: they are live views over the PTY
     /// and are rebuilt from PTY output on reattach, never persisted.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         id: SessionId,
         title: Option<String>,
         cwd: Option<String>,
         identity: IdentityContext,
         messages: Vec<ProviderMessage>,
+        summary: Option<String>,
         rows: usize,
         cols: usize,
     ) -> Self {
         let mut conversation = Conversation::new();
         for message in messages {
             conversation.push(message);
+        }
+        // The rolling context summary lives beside the message list, not in
+        // it, so it has to be restored explicitly — otherwise reopening a
+        // long session silently drops everything that was ever trimmed.
+        if let Some(summary) = summary {
+            conversation.set_summary(summary);
         }
         Self {
             id,

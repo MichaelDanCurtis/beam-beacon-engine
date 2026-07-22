@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -117,17 +118,83 @@ impl Provider for MockProvider {
     }
 }
 
-/// Summarizer that records what it was asked to summarize.
+/// Summarizer that records what it was asked to summarize, and the prior
+/// summary it was handed.
 struct RecordingSummarizer {
     seen: Mutex<Vec<Vec<ProviderMessage>>>,
+    previous: Mutex<Vec<Option<String>>>,
     reply: Option<String>,
 }
 
+impl RecordingSummarizer {
+    fn new(reply: Option<&str>) -> Self {
+        Self {
+            seen: Mutex::new(Vec::new()),
+            previous: Mutex::new(Vec::new()),
+            reply: reply.map(str::to_owned),
+        }
+    }
+}
+
 impl Summarizer for RecordingSummarizer {
-    fn summarize<'a>(&'a self, evicted: &'a [ProviderMessage]) -> BoxFuture<'a, Option<String>> {
+    fn summarize<'a>(
+        &'a self,
+        previous_summary: Option<&'a str>,
+        evicted: &'a [ProviderMessage],
+    ) -> BoxFuture<'a, Option<String>> {
         async move {
             self.seen.lock().unwrap().push(evicted.to_vec());
+            self.previous
+                .lock()
+                .unwrap()
+                .push(previous_summary.map(str::to_owned));
             self.reply.clone()
+        }
+        .boxed()
+    }
+}
+
+/// Summarizer that signals it started, then never finishes — for asserting
+/// that cancelling inside the hook costs no history.
+struct HangingSummarizer {
+    started: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl Summarizer for HangingSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        _previous_summary: Option<&'a str>,
+        _evicted: &'a [ProviderMessage],
+    ) -> BoxFuture<'a, Option<String>> {
+        async move {
+            if let Some(tx) = self.started.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            std::future::pending::<()>().await;
+            unreachable!("pending future resolved")
+        }
+        .boxed()
+    }
+}
+
+/// Summarizer returning a fixed-length reply, counting its invocations.
+struct CountingSummarizer {
+    calls: Mutex<Vec<Option<String>>>,
+}
+
+impl Summarizer for CountingSummarizer {
+    fn summarize<'a>(
+        &'a self,
+        previous_summary: Option<&'a str>,
+        _evicted: &'a [ProviderMessage],
+    ) -> BoxFuture<'a, Option<String>> {
+        async move {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(previous_summary.map(str::to_owned));
+            // A realistic summarizer folds the prior summary into a reply
+            // of roughly constant length. Fixed width here so the token
+            // plateau below can be asserted exactly.
+            Some(format!("rolling summary #{:04}", calls.len()))
         }
         .boxed()
     }
@@ -966,10 +1033,7 @@ async fn cancel_during_backoff_sleep() {
 #[tokio::test]
 async fn context_trimming_evicts_summarizes_and_keeps_tool_pairs() {
     let provider = MockProvider::new(vec![text_round(&["reply"], StopReason::EndTurn)]);
-    let summarizer = Arc::new(RecordingSummarizer {
-        seen: Mutex::new(Vec::new()),
-        reply: Some("stuff happened".to_owned()),
-    });
+    let summarizer = Arc::new(RecordingSummarizer::new(Some("stuff happened")));
     let config = AgentConfig {
         context: ContextPolicy {
             max_context_tokens: 150,
@@ -1026,11 +1090,16 @@ async fn context_trimming_evicts_summarizes_and_keeps_tool_pairs() {
         .await
         .unwrap();
 
-    // The summarizer saw exactly the two evicted old messages, in order.
+    // The summarizer saw exactly the two evicted old messages, in order,
+    // and had no prior summary to fold in on the first trim.
     let seen = summarizer.seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0], vec![old_user, old_assistant]);
     drop(seen);
+    assert_eq!(summarizer.previous.lock().unwrap().as_slice(), &[None]);
+
+    // The summary lives in its own slot, not in the host-owned history.
+    assert_eq!(conversation.summary(), Some("stuff happened"));
 
     // keep_recent_messages = 3 protects [tool_results, recent_assistant,
     // User("new question")]; the tool pair must survive intact because its
@@ -1038,6 +1107,22 @@ async fn context_trimming_evicts_summarizes_and_keeps_tool_pairs() {
     assert_eq!(
         conversation.messages(),
         &[
+            ProviderMessage::System("sys".to_owned()),
+            tool_assistant.clone(),
+            tool_results.clone(),
+            recent_assistant.clone(),
+            ProviderMessage::User("new question".to_owned()),
+            ProviderMessage::Assistant(AssistantMessage {
+                text: "reply".to_owned(),
+                ..AssistantMessage::default()
+            }),
+        ]
+    );
+    // ...and is spliced right after the host's system prompt on the way to
+    // the provider, without displacing it.
+    assert_eq!(
+        conversation.provider_messages(),
+        vec![
             ProviderMessage::System("sys".to_owned()),
             ProviderMessage::System("Summary of earlier conversation: stuff happened".to_owned()),
             tool_assistant,
@@ -1057,6 +1142,481 @@ async fn context_trimming_evicts_summarizes_and_keeps_tool_pairs() {
     assert!(matches!(
         request.messages[1],
         ProviderMessage::System(ref s) if s.starts_with("Summary of earlier conversation:")
+    ));
+}
+
+#[tokio::test]
+async fn repeated_trimming_keeps_exactly_one_summary_and_bounded_tokens() {
+    // Regression: every trim used to append a fresh, permanently
+    // non-evictable `System` summary. 40 turns produced 39 of them, an
+    // approx_tokens far above the budget, and no way back under it.
+    const TURNS: usize = 40;
+    let scripts = (0..TURNS)
+        .map(|_| text_round(&["r".repeat(400).as_str()], StopReason::EndTurn))
+        .collect();
+    let provider = MockProvider::new(scripts);
+    let summarizer = Arc::new(CountingSummarizer {
+        calls: Mutex::new(Vec::new()),
+    });
+    let config = AgentConfig {
+        context: ContextPolicy {
+            max_context_tokens: 300,
+            keep_recent_messages: 2,
+        },
+        ..test_config()
+    };
+    let agent = agent(provider, echo_bridge(), config).with_summarizer(summarizer.clone());
+
+    let mut conversation = Conversation::new();
+    let mut tokens_over_time = Vec::new();
+    for turn in 0..TURNS {
+        let (tx, _rx) = unbounded_channel();
+        agent
+            .run_turn(
+                &mut conversation,
+                UserInput::Text(format!("q{turn} {}", "u".repeat(400))),
+                &ToolContext::default(),
+                &CancellationToken::new(),
+                tx,
+            )
+            .await
+            .unwrap();
+        tokens_over_time.push(conversation.approx_tokens());
+    }
+
+    // Exactly one engine summary, in its own slot.
+    assert!(conversation.summary().is_some());
+    let systems = conversation
+        .provider_messages()
+        .into_iter()
+        .filter(|m| matches!(m, ProviderMessage::System(_)))
+        .count();
+    assert_eq!(
+        systems, 1,
+        "expected a single rolling summary System message"
+    );
+    assert_eq!(
+        conversation.provider_messages().len(),
+        conversation.messages().len() + 1
+    );
+
+    // The history is bounded: keep_recent plus the tail of the final turn,
+    // never a function of the turn count.
+    assert!(
+        conversation.messages().len() <= 8,
+        "history grew to {} messages",
+        conversation.messages().len()
+    );
+
+    // ...and so is the token count. It plateaus rather than ratcheting.
+    let (early, late) = (tokens_over_time[TURNS / 4], tokens_over_time[TURNS - 1]);
+    assert!(
+        late <= early,
+        "approx_tokens ratcheted from {early} to {late} over {TURNS} turns"
+    );
+    assert!(
+        late < 400,
+        "approx_tokens {late} unbounded against a 300 budget"
+    );
+
+    // The summarizer was handed the previous summary from the second trim
+    // on, so it can fold rather than restart.
+    let calls = summarizer.calls.lock().unwrap();
+    assert!(
+        calls.len() >= 2,
+        "expected repeated trimming, got {calls:?}"
+    );
+    assert_eq!(calls[0], None);
+    assert!(
+        calls[1..].iter().all(Option::is_some),
+        "summarizer lost the prior summary: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_during_summarizer_preserves_evicted_history() {
+    // Regression: eviction used to be committed before the summarizer ran,
+    // so cancelling inside the hook returned `Cancelled` over a
+    // conversation whose history had already been thrown away unsummarized.
+    let (started_tx, started_rx) = oneshot::channel();
+    let provider = MockProvider::new(vec![text_round(&["never"], StopReason::EndTurn)]);
+    let config = AgentConfig {
+        context: ContextPolicy {
+            max_context_tokens: 150,
+            keep_recent_messages: 2,
+        },
+        ..test_config()
+    };
+    let agent = agent(provider.clone(), echo_bridge(), config).with_summarizer(Arc::new(
+        HangingSummarizer {
+            started: Mutex::new(Some(started_tx)),
+        },
+    ));
+
+    let mut conversation = Conversation::new();
+    conversation.push(ProviderMessage::User("a".repeat(400)));
+    conversation.push(ProviderMessage::Assistant(AssistantMessage {
+        text: "b".repeat(400),
+        ..AssistantMessage::default()
+    }));
+    conversation.push(ProviderMessage::User("c".repeat(400)));
+    let before = conversation.clone();
+
+    let cancel = CancellationToken::new();
+    let canceller_token = cancel.clone();
+    let canceller = async move {
+        started_rx.await.unwrap();
+        canceller_token.cancel();
+    };
+
+    let (tx, mut rx) = unbounded_channel();
+    let tool_ctx = ToolContext::default();
+    let (outcome, ()) = tokio::join!(
+        agent.run_turn(
+            &mut conversation,
+            UserInput::Text("new".to_owned()),
+            &tool_ctx,
+            &cancel,
+            tx,
+        ),
+        canceller,
+    );
+
+    assert_eq!(outcome.unwrap(), TurnOutcome::Cancelled);
+    assert_eq!(provider.request_count(), 0);
+    assert_eq!(count_cancelled(&drain(&mut rx)), 1);
+
+    // Nothing was evicted and no summary was invented: the only difference
+    // from the starting state is this turn's own user message.
+    let mut expected = before.messages().to_vec();
+    expected.push(ProviderMessage::User("new".to_owned()));
+    assert_eq!(conversation.messages(), expected.as_slice());
+    assert_eq!(conversation.summary(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Malformed / truncated provider streams
+// ---------------------------------------------------------------------------
+
+/// A round that streams one complete tool call, then stops for `stop`.
+fn tool_call_round_stopping_with(stop: StopReason) -> Script {
+    Script::Events(vec![
+        ProviderEvent::MessageStart,
+        ProviderEvent::ToolCallStart {
+            index: 0,
+            id: "call_1".to_owned(),
+            name: "echo".to_owned(),
+        },
+        ProviderEvent::ToolCallArgumentsDelta {
+            index: 0,
+            json_fragment: r#"{"q":"x"}"#.to_owned(),
+        },
+        ProviderEvent::ToolCallEnd { index: 0 },
+        ProviderEvent::Finished(stop),
+    ])
+}
+
+/// A bridge whose `echo` tool counts how many times it was dispatched.
+fn counting_bridge() -> (Arc<ToolBridge>, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let mut bridge = ToolBridge::new();
+    bridge
+        .register(Arc::new(FnTool::new(
+            "echo",
+            "echoes its arguments",
+            move |call, _ctx| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ToolDispatchResult::ok(format!("echo:{}", call.arguments))
+            },
+        )))
+        .unwrap();
+    (Arc::new(bridge), calls)
+}
+
+#[tokio::test]
+async fn tool_calls_under_a_non_tool_use_stop_are_paired_and_not_dispatched() {
+    // Regression: a round that streamed tool calls but stopped for any
+    // reason other than `ToolUse` used to push a lone `Assistant` message
+    // carrying `tool_use` ids with no `ToolResults` after it, and report
+    // success. Every subsequent request in that session was then rejected
+    // by the provider — a permanently bricked conversation.
+    //
+    // `MaxTokens` is the reachable one: it is what Anthropic returns when
+    // the token limit truncates a `tool_use` block, and what OpenAI's
+    // `finish_reason: length` mid-`tool_calls` maps to.
+    for stop in [
+        StopReason::MaxTokens,
+        StopReason::EndTurn,
+        StopReason::StopSequence,
+        StopReason::ContentFilter,
+        StopReason::Other("length".to_owned()),
+    ] {
+        let provider = MockProvider::new(vec![tool_call_round_stopping_with(stop.clone())]);
+        let (bridge, dispatched) = counting_bridge();
+        let agent = agent(provider.clone(), bridge, test_config());
+        let mut conversation = Conversation::new();
+        let (tx, mut rx) = unbounded_channel();
+
+        let outcome = agent
+            .run_turn(
+                &mut conversation,
+                UserInput::Text("go".to_owned()),
+                &ToolContext::default(),
+                &CancellationToken::new(),
+                tx,
+            )
+            .await
+            .unwrap();
+
+        // The real stop reason is still reported...
+        assert_eq!(
+            outcome,
+            TurnOutcome::Completed {
+                stop_reason: stop.clone(),
+                usage: TokenUsage::default(),
+            },
+            "stop reason not preserved for {stop:?}"
+        );
+        // ...the turn did not loop for another round...
+        assert_eq!(provider.request_count(), 1, "looped for {stop:?}");
+        // ...the truncated request was never executed...
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            0,
+            "dispatched a tool the model never finished requesting ({stop:?})"
+        );
+
+        // ...and the assistant tool request is paired with an is_error
+        // result for every call id, so the history stays encodable.
+        assert_eq!(conversation.messages().len(), 3, "shape wrong for {stop:?}");
+        let calls = assistant_tool_calls(&conversation.messages()[1]);
+        assert_eq!(calls.len(), 1);
+        match &conversation.messages()[2] {
+            ProviderMessage::ToolResults(results) => {
+                assert_eq!(results.len(), calls.len());
+                assert_eq!(results[0].call_id, calls[0].id);
+                assert_eq!(results[0].name, calls[0].name);
+                assert!(results[0].is_error, "result not an error for {stop:?}");
+                assert!(
+                    results[0].content.contains("not executed"),
+                    "unhelpful content for {stop:?}: {}",
+                    results[0].content
+                );
+            }
+            other => panic!("expected ToolResults for {stop:?}, got {other:?}"),
+        }
+
+        let events = drain(&mut rx);
+        assert!(
+            events.contains(&AgentEvent::TurnCompleted {
+                stop_reason: stop.clone()
+            }),
+            "missing TurnCompleted for {stop:?}"
+        );
+        // Nothing ran, so nothing is reported as having run.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCallStarted { .. })),
+            "announced a dispatch that never happened ({stop:?})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_use_stop_with_zero_calls_completes_without_tool_results() {
+    // The degenerate converse: `ToolUse` but nothing assembled. There is
+    // no call to pair, so no `ToolResults` message is invented.
+    let provider = MockProvider::new(vec![text_round(&["hm"], StopReason::ToolUse)]);
+    let agent = agent(provider.clone(), echo_bridge(), test_config());
+    let mut conversation = Conversation::new();
+    let (tx, _rx) = unbounded_channel();
+
+    let outcome = agent
+        .run_turn(
+            &mut conversation,
+            UserInput::Text("go".to_owned()),
+            &ToolContext::default(),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Completed {
+            stop_reason: StopReason::ToolUse,
+            ..
+        }
+    ));
+    assert_eq!(conversation.messages().len(), 2);
+    assert_eq!(provider.request_count(), 1);
+}
+
+#[tokio::test]
+async fn stream_ending_without_finished_keeps_the_assembled_answer() {
+    // Regression: an OpenAI-compatible server that omits the trailing
+    // `data: [DONE]` (llama.cpp's server, some vLLM / LM Studio / proxy
+    // setups) streamed the whole answer to the UI and then had it thrown
+    // away, with the turn failing `Permanent` — never retried, nothing
+    // recorded. `Ok(())` from the transport asserts a clean end of stream,
+    // so the content is complete and is kept.
+    let provider = MockProvider::new(vec![Script::Events(vec![
+        ProviderEvent::MessageStart,
+        ProviderEvent::TextDelta("The answer ".to_owned()),
+        ProviderEvent::TextDelta("is 42.".to_owned()),
+        // No `Finished`.
+    ])]);
+    let agent = agent(provider.clone(), echo_bridge(), test_config());
+    let mut conversation = Conversation::new();
+    let (tx, mut rx) = unbounded_channel();
+
+    let outcome = agent
+        .run_turn(
+            &mut conversation,
+            UserInput::Text("go".to_owned()),
+            &ToolContext::default(),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+    let implicit = StopReason::Other(bb_agent_loop::IMPLICIT_STOP_REASON.to_owned());
+    assert_eq!(
+        outcome,
+        TurnOutcome::Completed {
+            stop_reason: implicit.clone(),
+            usage: TokenUsage::default(),
+        }
+    );
+    assert_eq!(
+        conversation.messages(),
+        &[
+            ProviderMessage::User("go".to_owned()),
+            ProviderMessage::Assistant(AssistantMessage {
+                text: "The answer is 42.".to_owned(),
+                ..AssistantMessage::default()
+            }),
+        ]
+    );
+    // The synthesized reason is distinguishable from a provider-sent one.
+    let events = drain(&mut rx);
+    assert!(events.contains(&AgentEvent::TurnCompleted {
+        stop_reason: implicit
+    }));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnFailed { .. })));
+    assert_eq!(provider.request_count(), 1);
+}
+
+#[tokio::test]
+async fn stream_ending_without_finished_or_content_still_fails() {
+    // Nothing to salvage: "the provider said nothing at all" stays an
+    // error rather than a silently empty success.
+    let provider = MockProvider::new(vec![Script::Events(vec![ProviderEvent::MessageStart])]);
+    let agent = agent(provider.clone(), echo_bridge(), test_config());
+    let mut conversation = Conversation::new();
+    let (tx, mut rx) = unbounded_channel();
+
+    let err = agent
+        .run_turn(
+            &mut conversation,
+            UserInput::Text("go".to_owned()),
+            &ToolContext::default(),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AgentError::Provider(_)), "got {err:?}");
+    // Only the user message: no empty assistant turn was recorded.
+    assert_eq!(conversation.messages().len(), 1);
+    assert!(matches!(
+        drain(&mut rx).last(),
+        Some(AgentEvent::TurnFailed { .. })
+    ));
+}
+
+#[tokio::test]
+async fn transport_error_is_never_salvaged_into_a_completed_turn() {
+    // The leniency above is scoped to `Ok(())`. A transport that reports
+    // failure still fails, even with content already streamed — otherwise
+    // a genuine truncation would masquerade as a finished answer.
+    let provider = MockProvider::new(vec![Script::Fail(
+        vec![
+            ProviderEvent::MessageStart,
+            ProviderEvent::TextDelta("The answer is 4".to_owned()),
+        ],
+        ProviderCallError::Permanent("connection reset mid-body".to_owned()),
+    )]);
+    let agent = agent(provider, echo_bridge(), test_config());
+    let mut conversation = Conversation::new();
+    let (tx, _rx) = unbounded_channel();
+
+    let err = agent
+        .run_turn(
+            &mut conversation,
+            UserInput::Text("go".to_owned()),
+            &ToolContext::default(),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        AgentError::Provider("connection reset mid-body".to_owned())
+    );
+    assert_eq!(conversation.messages().len(), 1);
+}
+
+#[tokio::test]
+async fn stream_without_finished_pairs_its_tool_calls() {
+    // The two leniencies compose: no terminator means we cannot know the
+    // tool request was complete, so it is answered rather than dispatched
+    // and the history stays encodable.
+    let provider = MockProvider::new(vec![Script::Events(vec![
+        ProviderEvent::MessageStart,
+        ProviderEvent::ToolCallStart {
+            index: 0,
+            id: "call_1".to_owned(),
+            name: "echo".to_owned(),
+        },
+        ProviderEvent::ToolCallArgumentsDelta {
+            index: 0,
+            json_fragment: r#"{"q":"x"}"#.to_owned(),
+        },
+        ProviderEvent::ToolCallEnd { index: 0 },
+        // No `Finished`.
+    ])]);
+    let (bridge, dispatched) = counting_bridge();
+    let agent = agent(provider, bridge, test_config());
+    let mut conversation = Conversation::new();
+    let (tx, _rx) = unbounded_channel();
+
+    let outcome = agent
+        .run_turn(
+            &mut conversation,
+            UserInput::Text("go".to_owned()),
+            &ToolContext::default(),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    assert_eq!(conversation.messages().len(), 3);
+    assert!(matches!(
+        &conversation.messages()[2],
+        ProviderMessage::ToolResults(r) if r.len() == 1 && r[0].is_error
     ));
 }
 
@@ -1408,10 +1968,7 @@ async fn metrics_context_trimming_records_eviction_count_and_summary_flag() {
         ..test_config()
     };
     let (agent, sink) = recording_agent(provider, echo_bridge(), config);
-    let agent = agent.with_summarizer(Arc::new(RecordingSummarizer {
-        seen: Mutex::new(Vec::new()),
-        reply: Some("stuff happened".to_owned()),
-    }));
+    let agent = agent.with_summarizer(Arc::new(RecordingSummarizer::new(Some("stuff happened"))));
     let mut conversation = trim_prefill();
     let (tx, _rx) = unbounded_channel();
     agent

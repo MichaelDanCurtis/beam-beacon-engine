@@ -26,7 +26,7 @@ Both products consume this repository as a workspace of small focused crates. Be
 
 ## Status
 
-> **Implemented, pre-adoption.** All seven crates below have full, freshly-written implementations backed by 365 tests at 96% line coverage, including end-to-end tests that drive realistic shell transcripts through the whole seam. CI enforces eight gates: libs-only build, tests, doctests, a coverage floor, `clippy -D warnings`, `fmt --check`, an MSRV build, and `cargo deny`. What remains is consumer-side: wiring Beam and Beacon to depend on the engine and deleting their in-tree duplicates — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and [`docs/MIGRATION-CHECKLIST.md`](docs/MIGRATION-CHECKLIST.md).
+> **Implemented, pre-adoption.** All seven crates below have full, freshly-written implementations backed by 487 tests at 97% line coverage, including end-to-end tests that drive realistic shell transcripts through the whole seam and adversarial probes for wide-character integrity, parser state-machine recovery, and agent cancellation. CI enforces eight gates: libs-only build, tests, doctests, a coverage floor, `clippy -D warnings`, `fmt --check`, an MSRV build, and `cargo deny`. What remains is consumer-side: wiring Beam and Beacon to depend on the engine and deleting their in-tree duplicates — see [`docs/INTEGRATION.md`](docs/INTEGRATION.md) and [`docs/MIGRATION-CHECKLIST.md`](docs/MIGRATION-CHECKLIST.md).
 
 ## Crates
 

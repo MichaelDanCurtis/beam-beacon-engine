@@ -14,15 +14,19 @@
 //!
 //! - **Turn structure** — user input → provider call → tool calls → tool
 //!   results → next provider call → final output
-//!   ([`AgentLoop::run_turn`]).
+//!   ([`AgentLoop::run_turn`]). Every assistant message carrying tool
+//!   calls is always paired with tool results, on every exit path, so a
+//!   turn can never leave history the provider will reject.
 //! - **Streaming** — [`AgentEvent`]s delivered to the UI as they happen.
+//!   A stream that ends cleanly without an explicit stop reason still
+//!   keeps its content ([`IMPLICIT_STOP_REASON`]).
 //! - **Cancellation** — a sticky, clonable [`CancellationToken`] honored
-//!   at every await point.
+//!   at every await point, never at the cost of conversation history.
 //! - **Retry policy** — exponential backoff for transient provider errors
 //!   ([`RetryPolicy`]).
 //! - **Conversation state** — [`Conversation`] history with
 //!   context-window trimming ([`ContextPolicy`]) and an optional
-//!   [`Summarizer`] hook.
+//!   [`Summarizer`] hook feeding a single rolling summary slot.
 //! - **Telemetry** — structured [`MetricEvent`]s handed to an optional
 //!   host-provided [`MetricsSink`] ([`AgentLoop::with_metrics`]), so each
 //!   consumer plugs its own backend. A loop without a sink records
@@ -74,7 +78,7 @@ mod metrics;
 mod provider;
 pub mod testing;
 
-pub use agent::{AgentLoop, CANCELLATION_MARKER};
+pub use agent::{AgentLoop, CANCELLATION_MARKER, IMPLICIT_STOP_REASON};
 pub use cancel::CancellationToken;
 pub use config::{AgentConfig, ContextPolicy, RetryPolicy};
 pub use conversation::Conversation;

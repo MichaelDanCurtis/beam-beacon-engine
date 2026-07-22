@@ -82,6 +82,55 @@ for — every one of these passed the per-crate unit suites:
 - **Block pruning was unreachable** through `Session`, so the block list
   grew unboundedly. `Session::prune_blocks` and
   `Session::with_scrollback` added.
+
+Found by two adversarial audits that attacked the crates with executed
+probes rather than more unit tests. Every one of these passed the
+existing suites at 94–97% line coverage:
+
+*Terminal layer*
+
+- **`clear` destroyed scrollback.** `CSI 3 J` is xterm's "erase saved
+  lines", but it was mapped to "clear screen", so every `clear` *added*
+  a screenful of blanks — 48 rows per invocation. After 300 `clear`s all
+  10,000 retained rows were blank and earlier output was unrecoverable.
+- **Resizing during a full-screen app deleted shell history.** The
+  shrink path consulted the shared cursor, which belongs to the
+  alternate screen while vim/htop is up, and rows that were not shed
+  were dropped without ever reaching scrollback.
+- **Wide characters were orphaned by six editing paths** (ECH, DCH, ICH,
+  EL ×2, ED) — the operations tmux and readline use constantly. Orphaned
+  half-characters froze into scrollback permanently. A lead/trail
+  invariant checker now runs over a randomized op storm.
+- **An unterminated `ESC P` wedged the parser forever**, swallowing all
+  later output; `ESC` now cancels DCS/SOS/PM/APC per the DEC parser.
+- **`ESC` + a run of `0x20..0x2F` allocated without bound** (8 MiB
+  measured, now 8 bytes).
+- `DECSTR` (`CSI ! p`) was a no-op; extreme host dimensions panicked;
+  `viewport_rows` could hang once the panic was fixed.
+
+*Agent layer*
+
+- **A truncated tool call permanently bricked a session.** A round that
+  streamed tool calls but finished with `MaxTokens` stored the assistant
+  message with no paired results and reported success, so the host
+  persisted a conversation every provider rejects — and every later turn
+  in that session failed. This is exactly what Anthropic and OpenAI
+  return when the token limit truncates a tool call.
+- **Context summaries ratcheted forever**: each trim added a permanently
+  non-evictable `System` message (40 turns → 39 summaries, 795 tokens
+  against a 300 budget, no trimming left). Replaced by one rolling slot.
+- **A stream missing `data: [DONE]` discarded the whole answer** after
+  the user watched it stream in. `StreamDecoder::finish()` added, and
+  the loop now keeps assembled content when a stream ends cleanly
+  without an explicit stop reason.
+- **`RetryPolicy` panicked** on `max_backoff: Duration::MAX`.
+- **Cancelling during summarization silently deleted history.**
+- Framer buffers were uncapped (64 MB retained in testing); `is_error`
+  was silently dropped on OpenAI-compat and Ollama, so failed tools read
+  as successful; Anthropic thinking blocks lost the `signature` they
+  need to be replayed.
+- **Session snapshots lost the rolling summary** once it moved out of
+  the message list — a restored session forgot everything ever trimmed.
 - Initial scaffold: workspace, dual-license (MIT OR Apache-2.0), NOTICE
   with the no-upstream-Warp-code principle.
 - Architecture and integration docs under `docs/`.
@@ -90,7 +139,7 @@ for — every one of these passed the per-crate unit suites:
 ### Notes
 
 The engine-side implementation work (design + implementation for every
-crate) is complete: 365 tests, 96% workspace line coverage, and eight CI
+crate) is complete: 487 tests, 97% workspace line coverage, and eight CI
 gates — libs-only build, `--all-targets` tests, doctests, coverage floor,
 clippy `-D warnings`, fmt, MSRV 1.78, and `cargo deny`. The remaining
 migration steps — Beam and Beacon adoption PRs, in-tree cleanup, and the

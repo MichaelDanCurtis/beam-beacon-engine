@@ -61,6 +61,18 @@ pub struct SessionSnapshot {
     pub identity: IdentityContext,
     /// The full conversation transcript, oldest first.
     pub messages: Vec<ProviderMessage>,
+    /// The rolling context summary, when the agent loop has trimmed history
+    /// at least once.
+    ///
+    /// This is stored separately because it is not part of `messages` — the
+    /// agent loop keeps exactly one summary slot beside the transcript. It
+    /// carries everything that was evicted, so dropping it would make a
+    /// restored session forget its own past.
+    ///
+    /// `#[serde(default)]` keeps version-1 blobs written before this field
+    /// existed loadable; they simply restore with no summary.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// Persistent session history behind a host-provided [`KvStore`].
@@ -101,6 +113,7 @@ impl<S: KvStore> SessionHistory<S> {
             cwd: session.cwd().map(str::to_owned),
             identity: session.identity().clone(),
             messages: session.conversation().messages().to_vec(),
+            summary: session.conversation().summary().map(str::to_owned),
         };
         let bytes =
             serde_json::to_vec(&snapshot).map_err(|e| HistoryError::Serde(e.to_string()))?;
@@ -132,6 +145,7 @@ impl<S: KvStore> SessionHistory<S> {
             snapshot.cwd,
             snapshot.identity,
             snapshot.messages,
+            snapshot.summary,
             rows,
             cols,
         )
@@ -211,6 +225,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_trip_preserves_the_rolling_context_summary() {
+        // The agent loop keeps exactly one summary slot BESIDE the message
+        // list, so it is not covered by snapshotting `messages`. If it were
+        // dropped here, reopening a long session would silently lose
+        // everything that had ever been trimmed out of the transcript.
+        let history = SessionHistory::new(MemoryKvStore::new());
+        let mut session = populated_session("s_summary");
+        session
+            .conversation_mut()
+            .set_summary("earlier: user set up a Rust project");
+        history.save(&session).await.unwrap();
+
+        let snapshot = history
+            .load(&SessionId("s_summary".to_owned()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.summary.as_deref(),
+            Some("earlier: user set up a Rust project")
+        );
+
+        let restored = SessionHistory::<MemoryKvStore>::restore(snapshot, 24, 80);
+        assert_eq!(
+            restored.conversation().summary(),
+            Some("earlier: user set up a Rust project")
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_without_a_summary_field_still_loads() {
+        // Version-1 blobs were written before `summary` existed; they must
+        // keep loading rather than failing to deserialize.
+        let store = MemoryKvStore::new();
+        let blob = serde_json::json!({
+            "version": 1,
+            "id": "s_old",
+            "title": null,
+            "cwd": null,
+            "identity": "Anonymous",
+            "messages": []
+        });
+        store
+            .put("session/s_old", serde_json::to_vec(&blob).unwrap())
+            .await
+            .unwrap();
+
+        let history = SessionHistory::new(store);
+        let snapshot = history
+            .load(&SessionId("s_old".to_owned()))
+            .await
+            .unwrap()
+            .expect("v1 snapshot should load");
+        assert_eq!(snapshot.summary, None);
+    }
+
+    #[tokio::test]
     async fn save_load_restore_round_trip() {
         let history = SessionHistory::new(MemoryKvStore::new());
         let session = populated_session("s1");
@@ -269,7 +340,11 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        let mut expected = vec!["cwd", "id", "identity", "messages", "title", "version"];
+        // Pins the persisted schema: adding a key here must be a deliberate
+        // decision, and screen state must never become one.
+        let mut expected = vec![
+            "cwd", "id", "identity", "messages", "summary", "title", "version",
+        ];
         expected.sort_unstable();
         let mut actual = keys;
         actual.sort_unstable();

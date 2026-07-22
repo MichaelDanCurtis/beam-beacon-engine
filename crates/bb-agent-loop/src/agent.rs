@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use bb_providers::{
-    AssistantMessage, ProviderEvent, ProviderMessage, ProviderRequest, StopReason, TokenUsage,
-    ToolCall, ToolResult,
+    AssistantMessage, ProviderEvent, ProviderMessage, ProviderRequest, StopReason, ThinkingBlock,
+    TokenUsage, ToolCall, ToolResult,
 };
 use bb_tool_bridge::{ToolBridge, ToolContext};
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -22,6 +22,19 @@ use crate::provider::{Provider, ProviderCallError, Summarizer};
 /// when a turn is cancelled mid-stream, so later rounds (and humans reading
 /// the transcript) can tell the response was cut short.
 pub const CANCELLATION_MARKER: &str = "[response interrupted by cancellation]";
+
+/// [`StopReason::Other`] payload the loop synthesizes when a provider
+/// stream ended cleanly but never delivered [`ProviderEvent::Finished`].
+///
+/// Namespaced so it is unambiguously engine-generated: a host or
+/// [`MetricsSink`] seeing `StopReason::Other(s)` can compare `s` against
+/// this constant to tell "no terminator arrived" apart from a real
+/// provider-specific stop reason, which is passed through verbatim.
+///
+/// See [`AgentLoop::run_turn`] and the [`Provider`] contract for why the
+/// round is completed rather than failed.
+pub const IMPLICIT_STOP_REASON: &str =
+    "bb-agent-loop: stream ended without an explicit stop reason";
 
 /// Orchestrates AI agent turns over a [`Provider`] transport and a
 /// [`ToolBridge`].
@@ -112,6 +125,30 @@ impl AgentLoop {
     /// `events_tx` throughout (send failures are ignored, so a dropped
     /// receiver never aborts a turn).
     ///
+    /// # The tool-pairing invariant
+    ///
+    /// **An `Assistant` message carrying tool calls is always immediately
+    /// followed by a `ToolResults` message covering every one of its call
+    /// ids** — on every exit path, whatever the stop reason, however the
+    /// turn ended. Nothing else is a valid conversation: Anthropic rejects
+    /// the next request with *"tool_use ids were found without
+    /// tool_result blocks"* and `OpenAI` with *"an assistant message with
+    /// 'tool_calls' must be followed by tool messages"*, so a single
+    /// unpaired assistant message poisons the session's history for good.
+    ///
+    /// The interesting case is a round that streamed tool calls but
+    /// finished with a stop reason other than [`StopReason::ToolUse`] —
+    /// exactly what a provider reports when the token limit truncates a
+    /// `tool_use` block (Anthropic `stop_reason: max_tokens`, `OpenAI`
+    /// `finish_reason: length` mid-`tool_calls`). The loop **does not**
+    /// dispatch those calls: the model never finished asking, so their
+    /// arguments may be half-written, and running a truncated request is
+    /// worse than not running it. Instead it pairs them with synthesized
+    /// `is_error` results naming the stop reason, the same machinery
+    /// cancellation uses. The turn then completes normally and reports the
+    /// provider's real stop reason, so the caller still sees *why* the
+    /// round ended and the model can re-request the tool next turn.
+    ///
     /// # Cancellation
     ///
     /// `cancel` is honored at every await point: the provider stream, tool
@@ -189,7 +226,7 @@ impl AgentLoop {
             let request = ProviderRequest {
                 model: self.config.model.clone(),
                 system: None,
-                messages: conversation.messages().to_vec(),
+                messages: conversation.provider_messages(),
                 tools: tools.clone(),
                 max_tokens: self.config.max_tokens,
                 temperature: self.config.temperature,
@@ -232,14 +269,25 @@ impl AgentLoop {
                 },
             );
 
-            let is_tool_round =
-                round.stop_reason == StopReason::ToolUse && !round.message.tool_calls.is_empty();
             let tool_calls = round.message.tool_calls.clone();
+            let is_tool_round = round.stop_reason == StopReason::ToolUse && !tool_calls.is_empty();
             conversation.push(ProviderMessage::Assistant(round.message));
 
             if !is_tool_round {
                 // A `ToolUse` stop with zero assembled tool calls is
                 // degenerate; the turn completes rather than looping.
+                //
+                // Tool calls under a non-`ToolUse` stop reason mean the
+                // round was cut short mid-request. They are never
+                // dispatched, but they must still be answered or the
+                // history becomes unencodable — see the tool-pairing
+                // invariant in this method's docs.
+                if !tool_calls.is_empty() {
+                    conversation.push(ProviderMessage::ToolResults(unfinished_results(
+                        &tool_calls,
+                        &round.stop_reason,
+                    )));
+                }
                 emit(
                     &events_tx,
                     AgentEvent::TurnCompleted {
@@ -322,24 +370,44 @@ impl AgentLoop {
     }
 
     /// Trim the conversation to the context budget, invoking the
-    /// summarizer (cancellably) when messages were evicted.
+    /// summarizer (cancellably) when messages would be evicted.
     ///
-    /// Records [`MetricEvent::ContextTrimmed`] whenever eviction happened —
-    /// including when the summarizer hook was cancelled, in which case
-    /// `summarized` is `false`.
+    /// # Atomic with respect to cancellation
+    ///
+    /// Eviction is planned first and committed last: nothing is removed
+    /// from the conversation until the summarizer has resolved. A turn
+    /// cancelled inside the summarizer — a user pressing Esc while a cheap
+    /// model call is in flight — therefore leaves the conversation byte
+    /// for byte as it found it, rather than returning `Cancelled` over a
+    /// history that has already been destroyed and never summarized.
+    /// Dropping the whole `run_turn` future mid-summarizer is equally
+    /// safe, for the same reason.
+    ///
+    /// The summary lands in the conversation's single rolling slot,
+    /// replacing whatever was there, with the old summary handed to the
+    /// summarizer as prior context. See [`Conversation`] for why that slot
+    /// is bounded by design.
+    ///
+    /// Records [`MetricEvent::ContextTrimmed`] whenever eviction was
+    /// planned — including when the summarizer hook was cancelled, in
+    /// which case `summarized` is `false` and nothing was evicted after
+    /// all.
     async fn trim_context(
         &self,
         conversation: &mut Conversation,
         cancel: &CancellationToken,
     ) -> TrimOutcome {
-        let evicted = conversation.evict_over_budget(&self.config.context);
-        if evicted.is_empty() {
+        let plan = conversation.plan_eviction(&self.config.context);
+        if plan.is_empty() {
             return TrimOutcome::Done;
         }
-        let evicted_messages = evicted.len();
-        let mut summarized = false;
+        let evicted_messages = plan.len();
+
+        let mut new_summary = None;
         if let Some(summarizer) = &self.summarizer {
-            let summary = tokio::select! {
+            let previous = conversation.summary().map(str::to_owned);
+            let preview = conversation.evicted_preview(&plan);
+            new_summary = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     self.with_sink(|sink| {
@@ -350,12 +418,16 @@ impl AgentLoop {
                     });
                     return TrimOutcome::Cancelled;
                 }
-                summary = summarizer.summarize(&evicted) => summary,
+                summary = summarizer.summarize(previous.as_deref(), &preview) => summary,
             };
-            if let Some(text) = summary {
-                conversation.insert_summary(&text);
-                summarized = true;
-            }
+        }
+
+        // Commit: past this point the turn is no longer cancellable
+        // without losing the evicted history, so it is the last thing done.
+        conversation.commit_eviction(&plan);
+        let summarized = new_summary.is_some();
+        if let Some(text) = new_summary {
+            conversation.set_summary(text);
         }
         self.with_sink(|sink| {
             sink.record(&MetricEvent::ContextTrimmed {
@@ -565,6 +637,9 @@ enum TrimOutcome {
 struct RoundAccumulator {
     text: String,
     thinking: String,
+    /// Provider-opaque signature authenticating the thinking block, from
+    /// [`ProviderEvent::ThinkingSignature`]. Last one wins.
+    thinking_signature: Option<String>,
     calls: Vec<PendingToolCall>,
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
@@ -590,6 +665,11 @@ impl RoundAccumulator {
             ProviderEvent::ThinkingDelta(delta) => {
                 self.thinking.push_str(&delta);
                 emit(events_tx, AgentEvent::ThinkingDelta(delta));
+            }
+            // Opaque authentication for the thinking block, not content:
+            // stored for verbatim replay, never surfaced to the UI.
+            ProviderEvent::ThinkingSignature(signature) => {
+                self.thinking_signature = Some(signature);
             }
             ProviderEvent::ToolCallStart { index, id, name } => {
                 self.calls.push(PendingToolCall {
@@ -629,9 +709,39 @@ impl RoundAccumulator {
             .find(|c| c.index == index && !c.complete)
     }
 
-    /// Finish the round; `None` when the stream never delivered `Finished`.
+    /// Finish the round.
+    ///
+    /// `None` — which the caller turns into a failed attempt — only when
+    /// the stream delivered **neither** a `Finished` event **nor** any
+    /// content at all.
+    ///
+    /// # Why a missing `Finished` is not fatal on its own
+    ///
+    /// This runs after the transport resolved `Ok(())`, which per the
+    /// [`Provider`] contract asserts the stream ended *normally*; every
+    /// truncation, socket drop and read error is required to surface as
+    /// `Err` instead, and those paths are untouched by this leniency. So
+    /// content assembled here is a complete response from a server that
+    /// simply never sent its terminator sentinel — an `OpenAI`-compatible
+    /// server omitting `data: [DONE]` is the common case, and it is the
+    /// audience local-model adapters serve. The text has already been
+    /// streamed to the user's screen; discarding it and failing the turn
+    /// would be a user-visible data loss over a missing full stop.
+    ///
+    /// The round therefore completes with
+    /// [`StopReason::Other(IMPLICIT_STOP_REASON)`](crate::IMPLICIT_STOP_REASON),
+    /// which is distinguishable from any provider-sent stop reason, so
+    /// hosts and metrics sinks can still tell that no terminator arrived.
+    /// An empty stream stays an error: there is nothing to salvage, and
+    /// "the provider said nothing" is a real failure worth reporting.
     fn finish(self) -> Option<RoundResult> {
-        let stop_reason = self.stop_reason?;
+        let has_content =
+            !self.text.is_empty() || !self.thinking.is_empty() || !self.calls.is_empty();
+        let stop_reason = match self.stop_reason {
+            Some(stop_reason) => stop_reason,
+            None if has_content => StopReason::Other(IMPLICIT_STOP_REASON.to_owned()),
+            None => return None,
+        };
         let tool_calls = self
             .calls
             .into_iter()
@@ -644,7 +754,7 @@ impl RoundAccumulator {
         Some(RoundResult {
             message: AssistantMessage {
                 text: self.text,
-                thinking: non_empty(self.thinking),
+                thinking: thinking_block(self.thinking, self.thinking_signature),
                 tool_calls,
             },
             stop_reason,
@@ -668,7 +778,7 @@ impl RoundAccumulator {
         text.push_str(CANCELLATION_MARKER);
         Some(AssistantMessage {
             text,
-            thinking: non_empty(self.thinking),
+            thinking: thinking_block(self.thinking, self.thinking_signature),
             tool_calls: Vec::new(),
         })
     }
@@ -703,13 +813,44 @@ fn cancelled_results(calls: &[ToolCall]) -> Vec<ToolResult> {
         .collect()
 }
 
-/// `None` for an empty string, `Some` otherwise.
-fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
+/// Synthesized `is_error` results for tool calls the model streamed but
+/// never finished requesting, because the round stopped for some reason
+/// other than [`StopReason::ToolUse`].
+///
+/// These calls are deliberately **not** dispatched — see the tool-pairing
+/// invariant on [`AgentLoop::run_turn`]. The content names the stop reason
+/// so the model can see why its request was dropped and decide whether to
+/// re-issue it.
+fn unfinished_results(calls: &[ToolCall], stop_reason: &StopReason) -> Vec<ToolResult> {
+    let content = format!(
+        "Tool call not executed: the response stopped with {stop_reason:?} \
+         before the tool-use request was complete, so it was discarded. \
+         Request the tool again if it is still needed."
+    );
+    calls
+        .iter()
+        .map(|call| ToolResult {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            content: content.clone(),
+            images: Vec::new(),
+            is_error: true,
+        })
+        .collect()
+}
+
+/// The assembled thinking block, `None` when the round streamed no
+/// thinking at all.
+///
+/// `signature` is the provider's opaque attestation of the block
+/// ([`ProviderEvent::ThinkingSignature`]); it is carried through untouched
+/// because Anthropic rejects a replayed thinking block whose signature is
+/// missing or altered.
+fn thinking_block(text: String, signature: Option<String>) -> Option<ThinkingBlock> {
+    if text.is_empty() && signature.is_none() {
+        return None;
     }
+    Some(ThinkingBlock { text, signature })
 }
 
 fn add_usage(total: &mut TokenUsage, delta: TokenUsage) {

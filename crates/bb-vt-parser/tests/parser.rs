@@ -748,12 +748,15 @@ fn sgr_resets() {
     // Empty SGR = SGR 0.
     let (s, _) = run(b"\x1b[1;31m\x1b[m");
     assert_eq!(*s.pen(), bb_terminal_model::CellAttrs::default());
-    // 21 clears bold. KNOWN DIVERGENCE from xterm ctlseqs, which defines
-    // 21 as doubly-underlined; `CellAttrs` has no double-underline field,
-    // so we keep the older ECMA-48 bold-off reading rather than drop the
-    // parameter. See the note in `sgr.rs`.
+    // 21 clears bold. KNOWN DIVERGENCE: ECMA-48 and xterm both define 21
+    // as doubly-underlined, but `CellAttrs::underline` has no style, so
+    // we follow the rival bold-off convention instead. See `sgr.rs`.
     let (s, _) = run(b"\x1b[1m\x1b[21m");
     assert!(!s.pen().bold);
+    // 22 is "normal intensity" and clears both, which the model can
+    // represent exactly — `bold` and `dim` are independent fields.
+    let (s, _) = run(b"\x1b[1;2m\x1b[22m");
+    assert!(!s.pen().bold && !s.pen().dim);
 }
 
 #[test]

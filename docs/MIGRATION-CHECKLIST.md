@@ -39,7 +39,12 @@ the data model is uncontroversial.
 Depends on `bb-terminal-model`. Mostly mechanical because the VT100 /
 ANSI handling is well-known.
 
-- [x] Design PR — public API: `Parser { fn feed(&mut self, bytes: &[u8], grid: &mut Grid) }`
+- [x] Design PR — public API: `Parser { fn feed(&mut self, screen: &mut Screen, bytes: &[u8]) -> Vec<PositionedEvent> }`.
+      (The original sketch took a `&mut Grid` and returned nothing. It became
+      `&mut Screen` because the parser needs scroll regions and scrollback, and
+      it returns *positioned* events because a marker's cursor row must be
+      captured when the marker fires — reading it after the chunk makes block
+      boundaries depend on PTY read size.)
 - [x] Implementation PR — full CSI / SGR / OSC / DCS support. Property
       tests against the existing in-tree parsers (run the same input
       through engine + consumer-in-tree and assert identical grid state)

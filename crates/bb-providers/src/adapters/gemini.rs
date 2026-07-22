@@ -16,16 +16,23 @@
 //!   `{"error": <text>}`.
 //! - Tool-result images ride along as sibling `inline_data` parts in the
 //!   same user turn.
-//! - Assistant `thinking` has no input slot and is dropped on encode; on
-//!   decode, parts flagged `"thought": true` are surfaced as thinking.
+//! - Assistant `thinking` has no input slot and is dropped on encode
+//!   (signature included); on decode, parts flagged `"thought": true` are
+//!   surfaced as thinking, without a signature.
+//! - Messages carrying no content are omitted, matching the neutral-model
+//!   rule the other adapters follow; a request whose messages are all
+//!   empty is an encode error.
 
 use serde_json::{json, Value};
 
-use crate::adapters::{join_url, CompletedResponse, ProviderAdapter, StreamDecoder};
+use crate::adapters::{
+    empty_request_error, is_empty_message, join_url, tool_arguments_or_empty, unknown_stop_reason,
+    CompletedResponse, ProviderAdapter, StreamDecoder,
+};
 use crate::sse::SseFramer;
 use crate::types::{
     AssistantMessage, HttpRequestSpec, MessageImage, ProviderConfig, ProviderError, ProviderEvent,
-    ProviderMessage, ProviderRequest, StopReason, TokenUsage, ToolCall, UserContent,
+    ProviderMessage, ProviderRequest, StopReason, ThinkingBlock, TokenUsage, ToolCall, UserContent,
 };
 
 const PROVIDER: &str = "gemini";
@@ -98,11 +105,11 @@ fn encode_content(message: &ProviderMessage, out: &mut Vec<Value>) {
             }
             for call in &assistant.tool_calls {
                 parts.push(json!({
-                    "functionCall": {"name": call.name, "args": call.arguments},
+                    "functionCall": {
+                        "name": call.name,
+                        "args": tool_arguments_or_empty(Some(&call.arguments)),
+                    },
                 }));
-            }
-            if parts.is_empty() {
-                parts.push(json!({"text": ""}));
             }
             out.push(json!({"role": "model", "parts": parts}));
         }
@@ -140,7 +147,7 @@ fn decode_parts(
                 .and_then(Value::as_str)
                 .ok_or_else(|| ProviderError::decode(PROVIDER, "functionCall missing `name`"))?
                 .to_owned();
-            let arguments = call.get("args").cloned().unwrap_or(Value::Null);
+            let arguments = tool_arguments_or_empty(call.get("args"));
             tool_calls.push(ToolCall {
                 id: format!("call_{tool_index}", tool_index = *tool_index),
                 name,
@@ -170,17 +177,27 @@ impl ProviderAdapter for GeminiAdapter {
     ) -> Result<HttpRequestSpec, ProviderError> {
         let mut system_parts: Vec<&str> = Vec::new();
         if let Some(system) = &request.system {
-            system_parts.push(system);
+            if !system.is_empty() {
+                system_parts.push(system);
+            }
         }
         for message in &request.messages {
             if let ProviderMessage::System(text) = message {
-                system_parts.push(text);
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
             }
         }
 
         let mut contents = Vec::new();
         for message in &request.messages {
+            if is_empty_message(message) {
+                continue;
+            }
             encode_content(message, &mut contents);
+        }
+        if contents.is_empty() {
+            return Err(empty_request_error(PROVIDER));
         }
 
         let mut body = json!({"contents": contents});
@@ -265,10 +282,11 @@ impl ProviderAdapter for GeminiAdapter {
         Ok(CompletedResponse {
             message: AssistantMessage {
                 text,
+                // Gemini issues no thinking signature.
                 thinking: if thinking.is_empty() {
                     None
                 } else {
-                    Some(thinking)
+                    Some(ThinkingBlock::new(thinking))
                 },
                 tool_calls,
             },
@@ -293,6 +311,8 @@ struct GeminiStreamDecoder {
     next_tool_index: usize,
     saw_tool_call: bool,
     latest_usage: Option<TokenUsage>,
+    /// Set once a `finishReason` (or the EOF flush) emitted `Finished`.
+    finished: bool,
 }
 
 impl GeminiStreamDecoder {
@@ -303,7 +323,37 @@ impl GeminiStreamDecoder {
             next_tool_index: 0,
             saw_tool_call: false,
             latest_usage: None,
+            finished: false,
         }
+    }
+
+    /// Emit any pending usage plus `Finished`, at most once.
+    fn emit_finished(&mut self, reason: StopReason, out: &mut Vec<ProviderEvent>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(usage) = self.latest_usage.take() {
+            out.push(ProviderEvent::Usage(usage));
+        }
+        out.push(ProviderEvent::Finished(reason));
+    }
+
+    fn decode_frames(
+        &mut self,
+        frames: Vec<crate::sse::SseEvent>,
+        out: &mut Vec<ProviderEvent>,
+    ) -> Result<(), ProviderError> {
+        for frame in frames {
+            if frame.data.trim().is_empty() {
+                continue;
+            }
+            let data: Value = serde_json::from_str(&frame.data).map_err(|err| {
+                ProviderError::decode(PROVIDER, format!("invalid JSON in SSE data: {err}"))
+            })?;
+            self.handle_frame(&data, out)?;
+        }
+        Ok(())
     }
 
     fn handle_frame(
@@ -373,13 +423,8 @@ impl GeminiStreamDecoder {
         }
 
         if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
-            if let Some(usage) = self.latest_usage.take() {
-                out.push(ProviderEvent::Usage(usage));
-            }
-            out.push(ProviderEvent::Finished(map_finish_reason(
-                reason,
-                self.saw_tool_call,
-            )));
+            let reason = map_finish_reason(reason, self.saw_tool_call);
+            self.emit_finished(reason, out);
         }
         Ok(())
     }
@@ -388,15 +433,18 @@ impl GeminiStreamDecoder {
 impl StreamDecoder for GeminiStreamDecoder {
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<ProviderEvent>, ProviderError> {
         let mut out = Vec::new();
-        for frame in self.framer.feed(chunk)? {
-            if frame.data.trim().is_empty() {
-                continue;
-            }
-            let data: Value = serde_json::from_str(&frame.data).map_err(|err| {
-                ProviderError::decode(PROVIDER, format!("invalid JSON in SSE data: {err}"))
-            })?;
-            self.handle_frame(&data, &mut out)?;
-        }
+        let frames = self.framer.feed(chunk)?;
+        self.decode_frames(frames, &mut out)?;
+        Ok(out)
+    }
+
+    fn finish(&mut self) -> Result<Vec<ProviderEvent>, ProviderError> {
+        let mut out = Vec::new();
+        // The last `data:` frame often arrives without its blank line;
+        // flush it before deciding whether to synthesize a terminator.
+        let frames = self.framer.finish()?;
+        self.decode_frames(frames, &mut out)?;
+        self.emit_finished(unknown_stop_reason(), &mut out);
         Ok(out)
     }
 }
@@ -405,7 +453,10 @@ impl StreamDecoder for GeminiStreamDecoder {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::test_support::{assert_split_stable, config, full_conversation, image};
+    use crate::test_support::{
+        assert_split_stable, assert_terminator_optional, config, decode_stream, full_conversation,
+        image,
+    };
     use crate::types::{ToolResult, ToolSpec};
 
     #[test]
@@ -636,5 +687,112 @@ mod tests {
     #[test]
     fn stream_is_stable_under_pathological_chunking() {
         assert_split_stable(&GeminiAdapter, &tool_stream());
+    }
+
+    #[test]
+    fn stream_without_trailing_blank_line_decodes_identically() {
+        let full = tool_stream();
+        let truncated = full.strip_suffix(b"\n").unwrap().to_vec();
+        assert_terminator_optional(&GeminiAdapter, &full, &truncated);
+    }
+
+    #[test]
+    fn stream_without_finish_reason_still_finishes() {
+        let bytes = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",",
+            "\"parts\":[{\"text\":\"partial\"}]}}],",
+            "\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":1}}\n\n",
+        )
+        .as_bytes();
+        assert_eq!(
+            decode_stream(&GeminiAdapter, bytes),
+            vec![
+                ProviderEvent::MessageStart,
+                ProviderEvent::TextDelta("partial".to_owned()),
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 4,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                }),
+                ProviderEvent::Finished(StopReason::Other("unknown".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn finish_after_finish_reason_emits_nothing_more() {
+        let mut decoder = GeminiAdapter.stream_decoder();
+        decoder.feed(&tool_stream()).unwrap();
+        assert!(decoder.finish().unwrap().is_empty());
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decode_function_call_without_args_becomes_empty_object() {
+        let body = json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "now"}}]},
+                "finishReason": "STOP",
+            }],
+        });
+        let decoded = GeminiAdapter.decode_response(&body).unwrap();
+        assert_eq!(decoded.message.tool_calls[0].arguments, json!({}));
+
+        let spec = GeminiAdapter
+            .encode_request(
+                &config("https://g", None),
+                &ProviderRequest {
+                    model: "gemini-2.0-flash".to_owned(),
+                    system: None,
+                    messages: vec![ProviderMessage::Assistant(decoded.message)],
+                    tools: vec![],
+                    max_tokens: None,
+                    temperature: None,
+                    stream: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            spec.body["contents"][0]["parts"][0]["functionCall"]["args"],
+            json!({})
+        );
+    }
+
+    #[test]
+    fn encode_omits_empty_messages_and_rejects_an_empty_request() {
+        let request = ProviderRequest {
+            model: "gemini-2.0-flash".to_owned(),
+            system: Some(String::new()),
+            messages: vec![
+                ProviderMessage::User(String::new()),
+                ProviderMessage::Assistant(AssistantMessage::default()),
+                ProviderMessage::User("real".to_owned()),
+            ],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+        };
+        let spec = GeminiAdapter
+            .encode_request(&config("https://g", None), &request)
+            .unwrap();
+        assert_eq!(
+            spec.body,
+            json!({"contents": [{"role": "user", "parts": [{"text": "real"}]}]})
+        );
+
+        let empty = ProviderRequest {
+            messages: vec![ProviderMessage::ToolResults(vec![])],
+            ..request
+        };
+        assert!(matches!(
+            GeminiAdapter
+                .encode_request(&config("https://g", None), &empty)
+                .unwrap_err(),
+            ProviderError::Encode {
+                provider: "gemini",
+                ..
+            }
+        ));
     }
 }

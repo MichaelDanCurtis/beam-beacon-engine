@@ -39,10 +39,97 @@ pub enum UserContent {
 pub struct AssistantMessage {
     /// Visible response text (may be empty when the turn is pure tool use).
     pub text: String,
-    /// Extended-thinking / reasoning text, when the provider surfaced it.
-    pub thinking: Option<String>,
+    /// Extended-thinking / reasoning content, when the provider surfaced it.
+    pub thinking: Option<ThinkingBlock>,
     /// Tool invocations the model requested this turn, in order.
     pub tool_calls: Vec<ToolCall>,
+}
+
+/// Extended-thinking / reasoning content from one assistant turn.
+///
+/// The visible reasoning text plus an optional provider-opaque
+/// **signature**. Anthropic requires the signature to be echoed verbatim
+/// when a thinking block is replayed in a later assistant turn (extended
+/// thinking + tool use), so it must survive the round trip through the
+/// neutral model. Providers that expose no signature simply leave it
+/// `None`; providers that ignore thinking altogether ignore both fields.
+///
+/// [`String`] converts in (`ThinkingBlock::from`, [`ThinkingBlock::new`]),
+/// and the block derefs to `&str`, so signature-unaware code can treat it
+/// like the text it wraps.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct ThinkingBlock {
+    /// The reasoning text.
+    pub text: String,
+    /// Provider-opaque signature that authenticates `text`, when the
+    /// provider issued one. Never synthesize or mutate it — replay it
+    /// exactly as received or not at all.
+    pub signature: Option<String>,
+}
+
+impl ThinkingBlock {
+    /// A block with no signature.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            signature: None,
+        }
+    }
+
+    /// A block carrying the provider's signature.
+    pub fn with_signature(text: impl Into<String>, signature: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            signature: Some(signature.into()),
+        }
+    }
+
+    /// True when there is neither text nor a signature to send.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.signature.is_none()
+    }
+}
+
+impl From<String> for ThinkingBlock {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for ThinkingBlock {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+impl std::ops::Deref for ThinkingBlock {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl<'de> Deserialize<'de> for ThinkingBlock {
+    /// Accepts both the current struct form and a bare JSON string, so
+    /// conversations persisted before the signature field existed still
+    /// load.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Block {
+                text: String,
+                #[serde(default)]
+                signature: Option<String>,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Text(text) => Self::new(text),
+            Repr::Block { text, signature } => Self { text, signature },
+        })
+    }
 }
 
 /// A single tool invocation requested by the model.
@@ -121,6 +208,15 @@ pub enum ProviderEvent {
     TextDelta(String),
     /// A fragment of thinking / reasoning text.
     ThinkingDelta(String),
+    /// The provider-opaque signature authenticating this turn's thinking
+    /// content (Anthropic `signature_delta`).
+    ///
+    /// Carries the complete signature for the block; if more than one
+    /// arrives, the last one wins. Hosts must store it in
+    /// [`ThinkingBlock::signature`] — Anthropic rejects a replayed thinking
+    /// block whose signature is missing or altered. Providers that issue no
+    /// signature never emit this event.
+    ThinkingSignature(String),
     /// The model opened tool call `index` (0-based per message).
     ToolCallStart {
         /// Position of this tool call within the message.
@@ -252,5 +348,72 @@ impl ProviderError {
             provider,
             detail: detail.into(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_block_converts_from_strings() {
+        assert_eq!(
+            ThinkingBlock::from("hi".to_owned()),
+            ThinkingBlock::new("hi")
+        );
+        assert_eq!(ThinkingBlock::from("hi"), ThinkingBlock::new("hi"));
+        assert_eq!(ThinkingBlock::new("hi").signature, None);
+    }
+
+    #[test]
+    fn thinking_block_derefs_to_its_text() {
+        // Keeps `Option<ThinkingBlock>::as_deref()` and the usual `&str`
+        // methods working for signature-unaware call sites.
+        let block = Some(ThinkingBlock::with_signature("reasoning", "sig"));
+        assert_eq!(block.as_deref(), Some("reasoning"));
+        assert_eq!(block.as_deref().map(str::len), Some(9));
+    }
+
+    #[test]
+    fn thinking_block_is_empty_accounts_for_the_signature() {
+        assert!(ThinkingBlock::default().is_empty());
+        assert!(ThinkingBlock::new("").is_empty());
+        assert!(!ThinkingBlock::new("x").is_empty());
+        assert!(!ThinkingBlock::with_signature("", "sig").is_empty());
+    }
+
+    #[test]
+    fn thinking_block_json_round_trips() {
+        let block = ThinkingBlock::with_signature("reasoning", "sig");
+        let json = serde_json::to_string(&block).unwrap();
+        assert_eq!(json, r#"{"text":"reasoning","signature":"sig"}"#);
+        assert_eq!(serde_json::from_str::<ThinkingBlock>(&json).unwrap(), block);
+    }
+
+    #[test]
+    fn thinking_block_reads_legacy_bare_string() {
+        // Sessions persisted before the signature field existed stored
+        // `thinking` as a plain JSON string.
+        let legacy = r#"{"text":"hi","thinking":"older reasoning","tool_calls":[]}"#;
+        let message: AssistantMessage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            message.thinking,
+            Some(ThinkingBlock::new("older reasoning"))
+        );
+    }
+
+    #[test]
+    fn assistant_message_round_trips_through_json() {
+        let message = AssistantMessage {
+            text: "hi".to_owned(),
+            thinking: Some(ThinkingBlock::with_signature("why", "sig")),
+            tool_calls: vec![],
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AssistantMessage>(&json).unwrap(),
+            message
+        );
     }
 }
