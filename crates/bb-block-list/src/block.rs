@@ -71,6 +71,10 @@ pub struct Block {
     pub(crate) command: Option<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) exit_code: Option<i32>,
+    /// Whether this block was synthesized by the no-shell-integration
+    /// fallback rather than created by a prompt marker. Such a block is a
+    /// *guess*, and the first marker to arrive retracts it.
+    pub(crate) implicit: bool,
 }
 
 impl Block {
@@ -83,6 +87,7 @@ impl Block {
             command: None,
             cwd: None,
             exit_code: None,
+            implicit: false,
         }
     }
 

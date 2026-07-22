@@ -70,6 +70,20 @@ impl BlockList {
     /// `Running`, and a `CommandStart`/`CommandExecuted` arriving after
     /// `CommandFinished` closes the finished block and starts a new one.
     pub fn on_marker(&mut self, marker: PromptMarker, cursor_abs_row: usize) {
+        // The fallback block is a guess made while no prompt protocol had
+        // been seen. The first marker disproves that guess, so retract it
+        // rather than leaving a phantom block for the real markers to act
+        // on. Without this, whether the phantom exists depends purely on
+        // how the host chunked its PTY reads: a read carrying the shell's
+        // startup output but no *complete* marker creates it, a read
+        // carrying both does not.
+        if !self.saw_marker {
+            if let Some(block) = self.blocks.first() {
+                if self.blocks.len() == 1 && block.implicit {
+                    self.blocks.clear(); // `next_id` is untouched: ids are never reused.
+                }
+            }
+        }
         self.saw_marker = true;
         match marker {
             PromptMarker::PromptStart => {
@@ -115,11 +129,16 @@ impl BlockList {
                     open.exit_code = exit_code;
                 }
                 None => {
-                    // D without A: record what we can.
-                    self.push_block(cursor_abs_row, BlockLifecycle::Finished);
-                    if let Some(block) = self.blocks.last_mut() {
-                        block.exit_code = exit_code;
-                    }
+                    // `D` with nothing open finishes no command, so it
+                    // creates no block. This is not a corner case: the
+                    // standard integration for zsh (`precmd`) and bash
+                    // (`PROMPT_COMMAND`) emits `D` immediately before `A`,
+                    // and those hooks also run before the FIRST prompt — so
+                    // a real session's very first bytes are `OSC 133;D;0`
+                    // with no command behind them. Recording it produced a
+                    // phantom zero-width block reporting success, which a
+                    // UI renders as an empty completed command at the top
+                    // of every session.
                 }
             },
         }
@@ -217,6 +236,9 @@ impl BlockList {
     pub fn observe_row(&mut self, screen: &Screen) {
         if self.blocks.is_empty() && !self.saw_marker && Self::has_output(screen) {
             self.push_block(0, BlockLifecycle::Running);
+            if let Some(block) = self.blocks.last_mut() {
+                block.implicit = true;
+            }
         }
     }
 
@@ -582,14 +604,67 @@ mod tests {
     // -- Degenerate marker orders -------------------------------------------
 
     #[test]
-    fn finished_without_prompt_creates_finished_block() {
+    fn finished_without_prompt_creates_no_block() {
+        // `D` with nothing open finishes no command. Previously this
+        // manufactured a zero-width Finished block, which real shells
+        // trigger on their very first bytes (see the regression test
+        // below), putting a phantom empty block at the top of every
+        // session.
         let mut bl = BlockList::new();
         bl.on_marker(PromptMarker::CommandFinished { exit_code: Some(3) }, 7);
+        assert!(bl.is_empty());
+    }
+
+    #[test]
+    fn first_marker_retracts_a_fallback_block_created_before_it() {
+        // A host reading the PTY in small chunks sees the shell's startup
+        // output (zsh paints an inverse-video marker and a line of spaces)
+        // BEFORE any complete OSC 133 sequence arrives, which materializes
+        // the no-integration fallback block. The first real marker proves
+        // the shell does have integration, so that guess must be retracted
+        // — otherwise the block list's contents would depend on how the
+        // host happened to chunk its reads.
+        let mut screen = Screen::new(24, 80);
+        let mut bl = BlockList::new();
+        for ch in "startup noise".chars() {
+            screen.print(ch);
+        }
+        bl.observe_row(&screen);
+        assert_eq!(bl.len(), 1, "fallback block should exist before markers");
+
+        bl.on_marker(PromptMarker::CommandFinished { exit_code: Some(0) }, 0);
+        bl.on_marker(PromptMarker::PromptStart, 0);
+        bl.on_marker(PromptMarker::CommandExecuted, 1);
+
+        assert_eq!(bl.len(), 1, "the retracted guess must not linger");
+        let block = bl.latest().unwrap();
+        assert_eq!(block.lifecycle(), BlockLifecycle::Running);
+        assert_eq!(
+            block.exit_code(),
+            None,
+            "the preamble's exit code belongs to no command"
+        );
+    }
+
+    #[test]
+    fn real_shell_integration_preamble_creates_no_phantom_block() {
+        // Captured from a real zsh session: `precmd` runs before the FIRST
+        // prompt as well as after each command, so the session opens with
+        // `D` (from no command at all) immediately followed by `A`. Bash's
+        // PROMPT_COMMAND integration has the same shape.
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::CommandFinished { exit_code: Some(0) }, 0);
+        bl.on_marker(PromptMarker::PromptStart, 0);
+        bl.on_marker(PromptMarker::CommandStart, 0);
+        bl.on_marker(PromptMarker::CommandExecuted, 1);
+        bl.on_marker(PromptMarker::CommandFinished { exit_code: Some(0) }, 2);
+
+        // Exactly one block: the command that actually ran.
         assert_eq!(bl.len(), 1);
         let block = bl.latest().unwrap();
+        assert_eq!(block.start_row(), 0);
+        assert_eq!(block.exit_code(), Some(0));
         assert_eq!(block.lifecycle(), BlockLifecycle::Finished);
-        assert_eq!(block.start_row(), 7);
-        assert_eq!(block.exit_code(), Some(3));
     }
 
     #[test]
