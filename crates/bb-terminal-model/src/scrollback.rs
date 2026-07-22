@@ -46,6 +46,18 @@ impl Scrollback {
         self.rows.push_back(row);
     }
 
+    /// Drop every retained row.
+    ///
+    /// Dropped rows are counted as **evicted**, exactly as if they had
+    /// aged out one by one, so absolute row ids are never reused: the row
+    /// that was about to be pushed keeps the id it would have had. This is
+    /// what backs xterm's "Erase Saved Lines" (`CSI 3 J`); see
+    /// [`crate::Screen::erase_scrollback`].
+    pub fn clear(&mut self) {
+        self.evicted += self.rows.len();
+        self.rows.clear();
+    }
+
     /// Number of rows currently retained.
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -120,6 +132,31 @@ mod tests {
         sb.push_row(row_of('d'));
         assert_eq!(sb.evicted(), 2);
         assert_eq!(sb.row(0).unwrap()[0].ch, 'c');
+    }
+
+    #[test]
+    fn clear_drops_every_row_and_counts_it_as_evicted() {
+        let mut sb = Scrollback::new(10);
+        for ch in "abc".chars() {
+            sb.push_row(row_of(ch));
+        }
+        sb.clear();
+        assert!(sb.is_empty());
+        assert_eq!(sb.len(), 0);
+        // Ids 0..3 are spent forever: the next push must land at id 3.
+        assert_eq!(sb.evicted(), 3);
+        assert!(sb.row(0).is_none());
+        sb.push_row(row_of('d'));
+        assert_eq!(sb.evicted(), 3);
+        assert_eq!(sb.row(0).unwrap()[0].ch, 'd');
+    }
+
+    #[test]
+    fn clear_on_an_empty_scrollback_is_a_noop() {
+        let mut sb = Scrollback::new(10);
+        sb.clear();
+        assert_eq!(sb.evicted(), 0);
+        assert!(sb.is_empty());
     }
 
     #[test]

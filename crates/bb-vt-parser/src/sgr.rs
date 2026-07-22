@@ -26,6 +26,13 @@ pub(crate) fn apply(pen: &mut CellAttrs, params: &[Vec<u16>]) {
             7 => pen.reverse = true,
             8 => pen.hidden = true,
             9 => pen.strikethrough = true,
+            // KNOWN DIVERGENCE: xterm ctlseqs defines 21 as *doubly
+            // underlined*, not bold-off (that is 22 alone; 21-as-bold-off
+            // is the older ECMA-48 reading some terminals still use).
+            // `CellAttrs` has no double-underline field, so there is
+            // nothing faithful to record — we keep the ECMA-48 reading
+            // rather than drop the parameter on the floor. Revisit if
+            // `CellAttrs` ever grows an underline *style*.
             21 | 22 => {
                 pen.bold = false;
                 pen.dim = false;

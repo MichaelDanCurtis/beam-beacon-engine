@@ -72,9 +72,29 @@ struct SavedCursor {
 ///
 /// # Erase/scroll fill
 ///
-/// Cells vacated by erase, scroll, insert, and delete operations are filled
-/// with a blank cell carrying the current pen's *background* color
-/// (background-color-erase), with all other attributes reset.
+/// Cells vacated by *any* operation — erase, scroll, insert, delete, the
+/// area exposed by growing the screen, and the alternate screen's clear on
+/// entry — are filled with a blank cell carrying the current pen's
+/// *background* color (background-color-erase), with all other attributes
+/// reset. Only [`Screen::reset`] (RIS) fills with the terminal default,
+/// because RIS resets the pen first.
+///
+/// # Wide-character invariant
+///
+/// Every public operation leaves the grids *paired*: a
+/// [`CellWidth::WideLead`] always has a [`CellWidth::WideTrail`]
+/// immediately to its right, and a `WideTrail` always has a `WideLead`
+/// immediately to its left — row edges included. Any operation that
+/// writes or shifts part of a row heals both edges of the span it
+/// touched, so no half of a wide character can be stranded (and then
+/// frozen into scrollback) by an edit that cut a pair down the middle.
+///
+/// # Geometry limits
+///
+/// Dimensions are host-supplied and therefore untrusted. [`Screen::new`],
+/// [`Screen::with_scrollback`], and [`Screen::resize`] clamp them to at
+/// least `1 × 1` and at most [`Grid::MAX_ROWS`] × [`Grid::MAX_COLS`];
+/// absurd geometry yields a capped screen rather than a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
     primary: Grid,
@@ -82,6 +102,16 @@ pub struct Screen {
     alt_active: bool,
     scrollback: Scrollback,
     cursor: Cursor,
+    /// Live cursor of the screen that is **not** currently active.
+    ///
+    /// Cursor state is per-screen. The alternate screen's cursor must
+    /// never decide what the *primary* grid sheds on a resize (a
+    /// full-screen app parks its cursor wherever it likes, which has
+    /// nothing to do with where the shell's output ended), and vice
+    /// versa. [`Screen::enter_alt_screen`] / [`Screen::exit_alt_screen`]
+    /// park the outgoing screen's cursor here; the incoming screen
+    /// inherits the live position, which is the documented behavior.
+    inactive_cursor: Cursor,
     saved_primary: Option<SavedCursor>,
     saved_alt: Option<SavedCursor>,
     pen: CellAttrs,
@@ -101,22 +131,24 @@ impl Screen {
     /// Create a screen of `rows × cols` with the default scrollback
     /// capacity ([`Screen::DEFAULT_SCROLLBACK_LINES`]).
     ///
-    /// Dimensions are clamped to at least `1 × 1`.
+    /// Dimensions are clamped to at least `1 × 1` and at most
+    /// [`Grid::MAX_ROWS`] × [`Grid::MAX_COLS`].
     pub fn new(rows: usize, cols: usize) -> Self {
         Self::with_scrollback(rows, cols, Self::DEFAULT_SCROLLBACK_LINES)
     }
 
     /// Create a screen of `rows × cols` retaining at most `max_scrollback`
-    /// lines of history. Dimensions are clamped to at least `1 × 1`.
+    /// lines of history. Dimensions are clamped to at least `1 × 1` and at
+    /// most [`Grid::MAX_ROWS`] × [`Grid::MAX_COLS`].
     pub fn with_scrollback(rows: usize, cols: usize, max_scrollback: usize) -> Self {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
+        let (rows, cols) = Self::clamp_geometry(rows, cols);
         Self {
             primary: Grid::new(rows, cols),
             alt: Grid::new(rows, cols),
             alt_active: false,
             scrollback: Scrollback::new(max_scrollback),
             cursor: Cursor::default(),
+            inactive_cursor: Cursor::default(),
             saved_primary: None,
             saved_alt: None,
             pen: CellAttrs::default(),
@@ -259,6 +291,9 @@ impl Screen {
         // A wide char that doesn't fit in the remaining columns.
         if width == 2 && col + 2 > cols {
             if self.autowrap {
+                // The spacer overwrites the last column, which may be half
+                // of an existing pair; clear the whole pair first.
+                self.clean_wide_at(row, col);
                 let spacer = self.blank_cell();
                 if let Some(c) = self.grid_active_mut().cell_mut(row, col) {
                     *c = spacer;
@@ -275,8 +310,9 @@ impl Screen {
         if self.insert_mode {
             self.clean_wide_at(row, col);
             let blank = self.blank_cell();
-            if let Some(cells) = self.grid_active_mut().row_mut(row) {
-                let shift = width.min(cols - col);
+            let shift = width.min(cols - col);
+            let grid = self.grid_active_mut();
+            if let Some(cells) = grid.row_mut(row) {
                 if let Some(span) = cells.get_mut(col..) {
                     span.rotate_right(shift);
                     if let Some(head) = span.get_mut(..shift) {
@@ -285,13 +321,10 @@ impl Screen {
                         }
                     }
                 }
-                // A wide pair split at the row end leaves an orphan lead.
-                if let Some(last) = cells.last_mut() {
-                    if last.width == CellWidth::WideLead {
-                        *last = blank;
-                    }
-                }
             }
+            // The shift moved everything from `col` to the row end; a pair
+            // pushed across that end leaves an orphaned lead behind.
+            Self::heal_wide_span(grid, row, col, cols, blank);
         }
 
         self.clean_wide_at(row, col);
@@ -363,6 +396,20 @@ impl Screen {
         let cols = self.cols();
         let next = (self.cursor.col + 1..cols).find(|&c| self.tabs.get(c) == Some(&true));
         self.cursor.col = next.unwrap_or(cols - 1);
+    }
+
+    /// Backward tab (CBT): move the cursor to the previous tab stop on the
+    /// current row, or to column 0 if there is none.
+    ///
+    /// Honors the screen's own tab stops, so it is the exact inverse of
+    /// [`Screen::tab`] over whatever stops HTS/TBC have left in place.
+    /// Already at column 0, this is a no-op.
+    pub fn back_tab(&mut self) {
+        self.pending_wrap = false;
+        let prev = (0..self.cursor.col)
+            .rev()
+            .find(|&c| self.tabs.get(c) == Some(&true));
+        self.cursor.col = prev.unwrap_or(0);
     }
 
     /// Set a tab stop at the cursor column (HTS).
@@ -492,9 +539,18 @@ impl Screen {
     // -------------------------------------------------------------------
 
     /// Erase in display (ED). With [`EraseMode::All`] on the primary screen,
-    /// the current screen contents are first pushed to scrollback (like
-    /// modern terminals), so their absolute row ids remain addressable.
-    /// The cursor does not move.
+    /// the screen's contents are first pushed to scrollback (like modern
+    /// terminals), so their absolute row ids remain addressable. The cursor
+    /// does not move.
+    ///
+    /// Only rows up to the **last non-blank row** are pushed; trailing
+    /// blank rows are dropped. This matters more than it sounds: `clear(1)`
+    /// on a mostly-empty screen would otherwise spend a full screen of
+    /// scrollback per invocation, and a few hundred `clear`s would evict
+    /// every real line of history behind a wall of blanks. A row counts as
+    /// blank only when every cell is exactly [`Cell::default`] — a screen
+    /// painted with a non-default background is content, not emptiness. A
+    /// wholly blank screen pushes nothing at all.
     pub fn erase_in_display(&mut self, mode: EraseMode) {
         self.pending_wrap = false;
         let blank = self.blank_cell();
@@ -520,10 +576,14 @@ impl Screen {
             }
             EraseMode::All => {
                 if !self.alt_active {
-                    for r in 0..rows {
-                        if let Some(cells) = self.primary.row(r) {
-                            let owned = cells.to_vec();
-                            self.scrollback.push_row(owned);
+                    // History is the rows that held something, not the
+                    // height of the window they were shown in.
+                    if let Some(last) = Self::last_non_blank_row(&self.primary) {
+                        for r in 0..=last {
+                            if let Some(cells) = self.primary.row(r) {
+                                let owned = cells.to_vec();
+                                self.scrollback.push_row(owned);
+                            }
                         }
                     }
                 }
@@ -533,6 +593,9 @@ impl Screen {
     }
 
     /// Erase in line (EL) on the cursor's row. The cursor does not move.
+    ///
+    /// A wide-character pair straddling either end of the erased span is
+    /// cleared whole, so no orphaned half survives.
     pub fn erase_in_line(&mut self, mode: EraseMode) {
         self.pending_wrap = false;
         let blank = self.blank_cell();
@@ -544,17 +607,22 @@ impl Screen {
             EraseMode::ToStart => (0, col + 1),
             EraseMode::All => (0, cols),
         };
-        if let Some(cells) = self.grid_active_mut().row_mut(row) {
+        let grid = self.grid_active_mut();
+        if let Some(cells) = grid.row_mut(row) {
             if let Some(span) = cells.get_mut(start..end) {
                 for c in span {
                     *c = blank;
                 }
             }
         }
+        Self::heal_wide_span(grid, row, start, end, blank);
     }
 
     /// Erase `n` characters at and after the cursor on the current row
     /// (ECH). Cells are blanked in place; nothing shifts.
+    ///
+    /// A wide-character pair straddling either end of the erased span is
+    /// cleared whole, so no orphaned half survives.
     pub fn erase_chars(&mut self, n: usize) {
         self.pending_wrap = false;
         let blank = self.blank_cell();
@@ -562,29 +630,35 @@ impl Screen {
         let row = self.cursor.row;
         let col = self.cursor.col.min(cols - 1);
         let end = col.saturating_add(n).min(cols);
-        if let Some(cells) = self.grid_active_mut().row_mut(row) {
+        let grid = self.grid_active_mut();
+        if let Some(cells) = grid.row_mut(row) {
             if let Some(span) = cells.get_mut(col..end) {
                 for c in span {
                     *c = blank;
                 }
             }
         }
+        Self::heal_wide_span(grid, row, col, end, blank);
     }
 
     /// Insert `n` blank characters at the cursor (ICH), shifting the rest
     /// of the row right; cells pushed past the last column are lost.
+    ///
+    /// A wide-character pair split at the insertion point, or pushed
+    /// across the row end, is cleared whole rather than left orphaned.
     pub fn insert_chars(&mut self, n: usize) {
         self.pending_wrap = false;
         let blank = self.blank_cell();
         let cols = self.cols();
         let row = self.cursor.row;
         let col = self.cursor.col.min(cols - 1);
-        self.clean_wide_at(row, col);
         let n = n.min(cols - col);
         if n == 0 {
             return;
         }
-        if let Some(cells) = self.grid_active_mut().row_mut(row) {
+        self.clean_wide_at(row, col);
+        let grid = self.grid_active_mut();
+        if let Some(cells) = grid.row_mut(row) {
             if let Some(span) = cells.get_mut(col..) {
                 span.rotate_right(n);
                 if let Some(head) = span.get_mut(..n) {
@@ -594,22 +668,28 @@ impl Screen {
                 }
             }
         }
+        Self::heal_wide_span(grid, row, col, cols, blank);
     }
 
     /// Delete `n` characters at the cursor (DCH), shifting the rest of the
     /// row left and blanking the vacated cells at the end.
+    ///
+    /// A wide-character pair split at the cursor, or cut in half by the
+    /// text shifted in from `col + n`, is cleared whole rather than left
+    /// orphaned.
     pub fn delete_chars(&mut self, n: usize) {
         self.pending_wrap = false;
         let blank = self.blank_cell();
         let cols = self.cols();
         let row = self.cursor.row;
         let col = self.cursor.col.min(cols - 1);
-        self.clean_wide_at(row, col);
         let n = n.min(cols - col);
         if n == 0 {
             return;
         }
-        if let Some(cells) = self.grid_active_mut().row_mut(row) {
+        self.clean_wide_at(row, col);
+        let grid = self.grid_active_mut();
+        if let Some(cells) = grid.row_mut(row) {
             if let Some(span) = cells.get_mut(col..) {
                 span.rotate_left(n);
                 let blank_from = span.len() - n;
@@ -620,6 +700,7 @@ impl Screen {
                 }
             }
         }
+        Self::heal_wide_span(grid, row, col, cols, blank);
     }
 
     /// Insert `n` blank lines at the cursor row (IL), shifting lines inside
@@ -751,24 +832,35 @@ impl Screen {
     // Alternate screen
     // -------------------------------------------------------------------
 
-    /// Switch to the alternate screen, clearing it first. No-op if already
-    /// active. The alternate screen has no scrollback. Cursor position is
-    /// preserved (callers implementing mode 1049 should bracket this with
+    /// Switch to the alternate screen, clearing it first (to the current
+    /// pen's background). No-op if already active. The alternate screen
+    /// has no scrollback. Cursor position is preserved (callers
+    /// implementing mode 1049 should bracket this with
     /// [`Screen::save_cursor`] / [`Screen::restore_cursor`]).
+    ///
+    /// The primary screen's cursor is parked, so a [`Screen::resize`]
+    /// during the alt-screen episode still knows where the *shell's*
+    /// output ended and does not let the running application's cursor
+    /// decide what the primary grid sheds.
     pub fn enter_alt_screen(&mut self) {
         if self.alt_active {
             return;
         }
+        self.inactive_cursor = self.cursor;
         self.alt_active = true;
-        self.alt.clear();
+        let blank = self.blank_cell();
+        self.alt.fill(blank);
         self.pending_wrap = false;
     }
 
-    /// Switch back to the primary screen. No-op if already primary.
+    /// Switch back to the primary screen. No-op if already primary. The
+    /// alternate screen's cursor is parked; the primary screen inherits
+    /// the live cursor position.
     pub fn exit_alt_screen(&mut self) {
         if !self.alt_active {
             return;
         }
+        self.inactive_cursor = self.cursor;
         self.alt_active = false;
         self.pending_wrap = false;
     }
@@ -777,82 +869,98 @@ impl Screen {
     // Resize and reset
     // -------------------------------------------------------------------
 
-    /// Resize both grids to `rows × cols` (clamped to at least `1 × 1`),
-    /// **preserving on-screen content**.
+    /// Resize both grids to `rows × cols`, **preserving on-screen
+    /// content**. Dimensions are clamped to at least `1 × 1` and at most
+    /// [`Grid::MAX_ROWS`] × [`Grid::MAX_COLS`].
     ///
     /// # Policy
     ///
     /// - **Overlap is kept.** A cell at `(row, col)` that exists in both the
     ///   old and the new dimensions keeps its character *and* its
-    ///   attributes. Cells exposed by growth are blank with default attrs.
+    ///   attributes. Cells exposed by growth are blank, carrying the
+    ///   current pen's background (background-color-erase).
     /// - **No reflow.** Lines are neither rewrapped when the screen narrows
     ///   nor unwrapped when it widens; columns past the new width are
     ///   dropped. (Reflow is a much larger change and is out of scope.) A
     ///   wide-character pair split by the new right edge has its orphaned
     ///   lead blanked so no half character survives.
-    /// - **Shrinking height keeps the bottom.** The cursor and the most
-    ///   recent output live near the bottom, so the rows that go are taken
-    ///   off the *top*: exactly as many as are needed to keep the cursor
-    ///   row on screen (`cursor_row + 1 - rows`, never more than the height
-    ///   lost). Those rows leave the primary grid the same way they would
-    ///   if the shell had scrolled them off — **pushed into scrollback** —
-    ///   so they are still addressable at *the same absolute row ids*. The
-    ///   alternate screen has no scrollback, so its shed rows are simply
-    ///   discarded. Any remaining height reduction comes off the bottom,
-    ///   which is where a terminal's blank/stale rows are.
+    /// - **Shrinking height never loses content.** Rows that no longer fit
+    ///   are taken off the *top* and **pushed into scrollback**, exactly as
+    ///   if the shell had scrolled them off, so they stay addressable at
+    ///   *the same absolute row ids*. Enough rows are shed to keep both the
+    ///   cursor row *and* the last row holding content on screen. Only
+    ///   genuinely blank trailing rows — every cell exactly
+    ///   [`Cell::default`] — are discarded off the bottom.
+    /// - **Each screen answers for itself.** The primary grid's shed count
+    ///   is decided by the *primary* cursor and the *primary* content; the
+    ///   alternate grid's by the alternate cursor. A full-screen
+    ///   application parking its cursor at the top or bottom has no say
+    ///   over the shell output underneath it. The alternate screen has no
+    ///   scrollback, so its shed rows are simply discarded and it never
+    ///   feeds — or renumbers — the primary timeline.
     /// - **Absolute rows stay coherent.** Every preserved row keeps its
-    ///   absolute id (rows shed off the top move into scrollback, which
-    ///   grows by exactly the same amount), and so does
-    ///   [`Screen::cursor_absolute_row`]. Scrollback itself is untouched —
+    ///   absolute id: rows shed off the top move into scrollback, which
+    ///   grows by exactly the same amount. Scrollback itself is untouched —
     ///   its rows keep the width they had when they were pushed.
-    /// - The cursor and both saved cursors follow their content and are
-    ///   clamped into the new bounds, the scroll region resets to the full
-    ///   screen, tab stops are rebuilt every 8 columns, and the
-    ///   pending-wrap flag is cleared (all standard on resize).
-    ///
-    /// Both grids are resized, each preserving its own contents. The single
-    /// shared cursor row decides the shed count for both.
+    ///   [`Screen::cursor_absolute_row`] is likewise unchanged whenever the
+    ///   cursor's row survives on the grid. It can only advance when the
+    ///   cursor sat *above* content that had to be preserved and its own
+    ///   row was shed into scrollback; the cursor then lands on the topmost
+    ///   surviving row, because a cursor cannot point into history.
+    /// - The cursor, the parked cursor of the inactive screen, and both
+    ///   saved cursors follow their own screen's content and are clamped
+    ///   into the new bounds; the scroll region resets to the full screen,
+    ///   tab stops are rebuilt every 8 columns, and the pending-wrap flag
+    ///   is cleared (all standard on resize).
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
+        let (rows, cols) = Self::clamp_geometry(rows, cols);
         let old_rows = self.rows();
+        let blank = self.blank_cell();
 
-        // Rows that must leave the top so the cursor stays on screen. When
-        // the cursor already fits, this is 0 and the height loss is taken
-        // off the bottom instead.
-        let lost = old_rows.saturating_sub(rows);
-        let shed = (self.cursor.row + 1).saturating_sub(rows).min(lost);
-        if shed > 0 {
+        // Each grid decides its own shed from its own cursor and its own
+        // content. Sharing one count is how the alt screen used to delete
+        // the shell output underneath it.
+        let primary_shed = self.primary_shed(rows);
+        let alt_shed = self.alt_shed(rows);
+
+        if primary_shed > 0 {
             // Primary rows leaving the top keep their absolute ids by
-            // moving into scrollback; the alternate screen has none.
-            for r in 0..shed {
+            // moving into scrollback.
+            for r in 0..primary_shed {
                 if let Some(cells) = self.primary.row(r) {
                     let owned = cells.to_vec();
                     self.scrollback.push_row(owned);
                 }
             }
-            let blank = Cell::default();
-            self.primary.scroll_up_within(0, old_rows - 1, shed, blank);
-            self.alt.scroll_up_within(0, old_rows - 1, shed, blank);
+            self.primary
+                .scroll_up_within(0, old_rows - 1, primary_shed, blank);
+        }
+        if alt_shed > 0 {
+            // The alternate screen has no history: its shed rows are gone.
+            self.alt.scroll_up_within(0, old_rows - 1, alt_shed, blank);
         }
 
-        let blank = Cell::default();
         self.primary.resize_preserving(rows, cols, blank);
         self.alt.resize_preserving(rows, cols, blank);
-        Self::heal_wide_edge(&mut self.primary, blank);
-        Self::heal_wide_edge(&mut self.alt, blank);
+        Self::heal_wide_edges(&mut self.primary, blank);
+        Self::heal_wide_edges(&mut self.alt, blank);
 
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
         self.tabs = Self::default_tabs(cols);
-        self.cursor.row = self.cursor.row.saturating_sub(shed).min(rows - 1);
-        self.cursor.col = self.cursor.col.min(cols - 1);
-        for saved in [&mut self.saved_primary, &mut self.saved_alt]
-            .into_iter()
-            .flatten()
-        {
-            saved.cursor.row = saved.cursor.row.saturating_sub(shed).min(rows - 1);
-            saved.cursor.col = saved.cursor.col.min(cols - 1);
+
+        let (live_shed, parked_shed) = if self.alt_active {
+            (alt_shed, primary_shed)
+        } else {
+            (primary_shed, alt_shed)
+        };
+        Self::follow_resize(&mut self.cursor, live_shed, rows, cols);
+        Self::follow_resize(&mut self.inactive_cursor, parked_shed, rows, cols);
+        if let Some(saved) = self.saved_primary.as_mut() {
+            Self::follow_resize(&mut saved.cursor, primary_shed, rows, cols);
+        }
+        if let Some(saved) = self.saved_alt.as_mut() {
+            Self::follow_resize(&mut saved.cursor, alt_shed, rows, cols);
         }
         self.pending_wrap = false;
     }
@@ -868,6 +976,7 @@ impl Screen {
         self.alt.clear();
         self.alt_active = false;
         self.cursor = Cursor::default();
+        self.inactive_cursor = Cursor::default();
         self.saved_primary = None;
         self.saved_alt = None;
         self.pen = CellAttrs::default();
@@ -878,6 +987,43 @@ impl Screen {
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
+    }
+
+    /// Soft terminal reset (DECSTR, `CSI ! p`).
+    ///
+    /// Restores origin mode, insert mode, and autowrap to their defaults,
+    /// resets the scroll region to the full screen, resets the pen, shows
+    /// the cursor, clears the pending-wrap flag, and drops the active
+    /// screen's saved cursor (so a later [`Screen::restore_cursor`] homes
+    /// the cursor with a default pen, as xterm does).
+    ///
+    /// Deliberately **does not** clear the screen, the scrollback, or the
+    /// tab stops, and does not move the cursor — that is [`Screen::reset`]
+    /// (RIS).
+    pub fn soft_reset(&mut self) {
+        self.origin_mode = false;
+        self.insert_mode = false;
+        self.autowrap = true;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows() - 1;
+        self.pen = CellAttrs::default();
+        self.cursor.visible = true;
+        self.pending_wrap = false;
+        *self.saved_slot_mut() = None;
+    }
+
+    /// Drop every retained scrollback row (xterm "Erase Saved Lines",
+    /// `CSI 3 J`).
+    ///
+    /// The grids, the cursor, and every mode are untouched — only history
+    /// goes. Absolute-id monotonicity is preserved: the dropped rows are
+    /// accounted for as *evicted*, so their ids are never reused and every
+    /// surviving row (including every grid row) keeps the id it already
+    /// had. [`Screen::line`] and [`Screen::row_text`] simply return `None`
+    /// for the dropped ids from now on, exactly as they do for rows that
+    /// aged out of a full buffer.
+    pub fn erase_scrollback(&mut self) {
+        self.scrollback.clear();
     }
 
     // -------------------------------------------------------------------
@@ -960,9 +1106,21 @@ impl Screen {
     /// [`Screen::line`] — including while the alternate screen is active.
     /// A viewport is a window onto history; to render the live screen, draw
     /// [`Screen::grid`] instead.
+    ///
+    /// `vp` is host-supplied and only bounds the *request*: both the
+    /// reservation and the scan are clipped to the ids that can actually
+    /// resolve, so an absurd `top` or `height` costs nothing — it can
+    /// neither overflow the allocator nor spin through a range of ids that
+    /// were never produced.
     pub fn viewport_rows(&self, vp: Viewport) -> Vec<&[Cell]> {
-        let mut out = Vec::with_capacity(vp.height);
-        for abs in vp.top..vp.top.saturating_add(vp.height) {
+        // Ids outside `evicted .. evicted + total_rows` never resolve, so
+        // clip to that window rather than walking the requested range.
+        let first = self.scrollback.evicted();
+        let past_end = first.saturating_add(self.total_rows());
+        let start = vp.top.max(first);
+        let end = vp.top.saturating_add(vp.height).min(past_end);
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        for abs in start..end {
             if let Some(row) = self.row_slice(abs) {
                 out.push(row);
             }
@@ -978,22 +1136,125 @@ impl Screen {
         (0..cols).map(|c| c != 0 && c % 8 == 0).collect()
     }
 
-    /// Blank any [`CellWidth::WideLead`] left stranded in the last column.
+    /// Clamp a host-supplied geometry into the range this crate will
+    /// allocate: at least `1 × 1`, at most [`Grid::MAX_ROWS`] ×
+    /// [`Grid::MAX_COLS`].
+    fn clamp_geometry(rows: usize, cols: usize) -> (usize, usize) {
+        (rows.clamp(1, Grid::MAX_ROWS), cols.clamp(1, Grid::MAX_COLS))
+    }
+
+    /// Restore the wide-pair invariant across the boundary immediately
+    /// *before* column `col` of `row`.
     ///
-    /// Narrowing a grid without reflow can cut a wide pair in half; the
-    /// trail cell falls off the edge and the lead would otherwise claim a
-    /// column it no longer has.
-    fn heal_wide_edge(grid: &mut Grid, blank: Cell) {
-        let Some(last) = grid.cols().checked_sub(1) else {
-            return;
-        };
-        for r in 0..grid.rows() {
-            if let Some(cell) = grid.cell_mut(r, last) {
-                if cell.width == CellWidth::WideLead {
+    /// Exactly two things can be wrong at a boundary, and this fixes both:
+    /// a [`CellWidth::WideLead`] at `col - 1` whose trail is no longer to
+    /// its right, and a [`CellWidth::WideTrail`] at `col` whose lead is no
+    /// longer to its left. Passing `col == 0` checks the row's left edge
+    /// and `col == cols` its right edge, since a lead in the last column
+    /// and a trail in the first are orphans by definition.
+    fn heal_wide_boundary(grid: &mut Grid, row: usize, col: usize, blank: Cell) {
+        let left_col = col.checked_sub(1);
+        let left = left_col.and_then(|c| grid.cell(row, c)).map(|c| c.width);
+        let right = grid.cell(row, col).map(|c| c.width);
+        let paired = left == Some(CellWidth::WideLead) && right == Some(CellWidth::WideTrail);
+        if !paired {
+            if left == Some(CellWidth::WideLead) {
+                if let Some(cell) = left_col.and_then(|c| grid.cell_mut(row, c)) {
+                    *cell = blank;
+                }
+            }
+            if right == Some(CellWidth::WideTrail) {
+                if let Some(cell) = grid.cell_mut(row, col) {
                     *cell = blank;
                 }
             }
         }
+    }
+
+    /// Restore the wide-pair invariant at **both** edges of the span
+    /// `[start, end)` that was just written to, shifted, or shifted into.
+    ///
+    /// Every span edit cuts the row in exactly two places; a wide pair
+    /// straddling either cut loses one half and must lose the other too.
+    fn heal_wide_span(grid: &mut Grid, row: usize, start: usize, end: usize, blank: Cell) {
+        Self::heal_wide_boundary(grid, row, start, blank);
+        Self::heal_wide_boundary(grid, row, end, blank);
+    }
+
+    /// Restore the wide-pair invariant at both edges of every row.
+    ///
+    /// Narrowing a grid without reflow can cut a wide pair in half: the
+    /// trail cell falls off the edge and the lead would otherwise claim a
+    /// column it no longer has.
+    fn heal_wide_edges(grid: &mut Grid, blank: Cell) {
+        let cols = grid.cols();
+        for r in 0..grid.rows() {
+            Self::heal_wide_span(grid, r, 0, cols, blank);
+        }
+    }
+
+    /// Whether `cells` holds nothing worth remembering: every cell is
+    /// exactly [`Cell::default`] (a space, default colors, no attributes,
+    /// single width).
+    fn row_is_blank(cells: &[Cell]) -> bool {
+        cells.iter().all(|c| *c == Cell::default())
+    }
+
+    /// Index of the last row of `grid` that holds content, or `None` if
+    /// the whole grid is blank.
+    fn last_non_blank_row(grid: &Grid) -> Option<usize> {
+        (0..grid.rows())
+            .rev()
+            .find(|&r| grid.row(r).is_some_and(|cells| !Self::row_is_blank(cells)))
+    }
+
+    /// How many rows the **primary** grid must shed off its top to shrink
+    /// to `rows`.
+    ///
+    /// Enough to keep the primary cursor on screen *and* enough that no
+    /// row still holding content falls off the bottom — whichever is
+    /// larger. Both bounds are at most the height actually lost, so the
+    /// result never exceeds it.
+    fn primary_shed(&self, rows: usize) -> usize {
+        let lost = self.rows().saturating_sub(rows);
+        if lost == 0 {
+            return 0;
+        }
+        let cursor_row = if self.alt_active {
+            self.inactive_cursor.row
+        } else {
+            self.cursor.row
+        };
+        let for_cursor = (cursor_row + 1).saturating_sub(rows);
+        let for_content = Self::last_non_blank_row(&self.primary)
+            .map_or(0, |last| (last + 1).saturating_sub(rows));
+        for_cursor.max(for_content).min(lost)
+    }
+
+    /// How many rows the **alternate** grid must shed off its top to
+    /// shrink to `rows`.
+    ///
+    /// Driven by the alternate cursor alone. There is nowhere to preserve
+    /// alt content — the alternate screen has no scrollback — so shed rows
+    /// are discarded and only the cursor's position matters.
+    fn alt_shed(&self, rows: usize) -> usize {
+        let lost = self.rows().saturating_sub(rows);
+        if lost == 0 {
+            return 0;
+        }
+        let cursor_row = if self.alt_active {
+            self.cursor.row
+        } else {
+            self.inactive_cursor.row
+        };
+        (cursor_row + 1).saturating_sub(rows).min(lost)
+    }
+
+    /// Move a cursor along with the `shed` rows its grid lost off the top,
+    /// then clamp it into the new bounds.
+    fn follow_resize(cursor: &mut Cursor, shed: usize, rows: usize, cols: usize) {
+        cursor.row = cursor.row.saturating_sub(shed).min(rows - 1);
+        cursor.col = cursor.col.min(cols - 1);
     }
 
     fn grid_active_mut(&mut self) -> &mut Grid {

@@ -35,6 +35,80 @@ fn active_text(screen: &Screen, row: usize) -> String {
         .collect()
 }
 
+/// A row's width tags as a compact string, e.g. `"S S L T S"`.
+fn widths(cells: &[Cell]) -> String {
+    cells
+        .iter()
+        .map(|c| match c.width {
+            CellWidth::Single => "S",
+            CellWidth::WideLead => "L",
+            CellWidth::WideTrail => "T",
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The width tags of active-grid row `row`.
+fn row_widths(screen: &Screen, row: usize) -> String {
+    widths(screen.grid().row(row).unwrap())
+}
+
+/// Panic if `cells` violates the wide-pair invariant: every `WideLead` is
+/// immediately followed by a `WideTrail` and every `WideTrail` is
+/// immediately preceded by a `WideLead` — row edges included, so a lead in
+/// the last column and a trail in the first are both orphans.
+fn assert_row_pairs_intact(cells: &[Cell], what: &str) {
+    for (i, cell) in cells.iter().enumerate() {
+        match cell.width {
+            CellWidth::WideLead => assert_eq!(
+                cells.get(i + 1).map(|c| c.width),
+                Some(CellWidth::WideTrail),
+                "{what}: orphaned WideLead at col {i} in [{}]",
+                widths(cells)
+            ),
+            CellWidth::WideTrail => assert_eq!(
+                i.checked_sub(1).and_then(|j| cells.get(j)).map(|c| c.width),
+                Some(CellWidth::WideLead),
+                "{what}: orphaned WideTrail at col {i} in [{}]",
+                widths(cells)
+            ),
+            CellWidth::Single => {}
+        }
+    }
+}
+
+/// Assert the wide-pair invariant over everything a `Screen` exposes: both
+/// grids and every retained scrollback row. An orphan that reaches
+/// scrollback is frozen there forever, so history is checked too.
+fn assert_pairs_intact(screen: &Screen, what: &str) {
+    for r in 0..screen.rows() {
+        assert_row_pairs_intact(
+            screen.grid().row(r).unwrap(),
+            &format!("{what}: active row {r}"),
+        );
+        assert_row_pairs_intact(
+            screen.primary_grid().row(r).unwrap(),
+            &format!("{what}: primary row {r}"),
+        );
+    }
+    for i in 0..screen.scrollback().len() {
+        assert_row_pairs_intact(
+            screen.scrollback().row(i).unwrap(),
+            &format!("{what}: scrollback row {i}"),
+        );
+    }
+}
+
+/// A 1×8 screen holding `ab漢cd`: `a b [漢 lead] [trail] c d _ _`. The
+/// wide pair sits at columns 2–3, so every editing operation can be aimed
+/// at its left half, its right half, or straight through it.
+fn wide_pair_row() -> Screen {
+    let mut s = Screen::new(1, 8);
+    put(&mut s, 0, "ab漢cd");
+    assert_eq!(row_widths(&s, 0), "S S L T S S S S");
+    s
+}
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -271,6 +345,243 @@ fn wide_char_on_one_column_screen_is_ignored() {
     s.print('你');
     assert_eq!(s.grid().cell(0, 0).unwrap().ch, ' ');
     assert_eq!((s.cursor().row, s.cursor().col), (0, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Wide characters: no editing path may strand half a pair
+//
+// Each case below is a real escape sequence applied to `ab漢cd`. Before the
+// fix every one of them left a `WideLead` with no `WideTrail` to its right
+// or a `WideTrail` with no `WideLead` to its left — and once such a row
+// scrolls into scrollback the corruption is frozen there forever.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dch_through_a_wide_pair_leaves_no_orphan_trail() {
+    // `\x1b[H\x1b[3P`: the trail cell gets shifted into column 0, where it
+    // has no lead to its left.
+    let mut s = wide_pair_row();
+    s.cursor_goto(0, 0);
+    s.delete_chars(3);
+    assert_eq!(row_widths(&s, 0), "S S S S S S S S");
+    assert_eq!(grid_text(&s, 0), " cd");
+    assert_pairs_intact(&s, "DCH 3");
+}
+
+#[test]
+fn ich_pushing_a_wide_lead_off_the_row_end_leaves_no_orphan() {
+    // `\x1b[H\x1b[2@` on `ab漢`: the shift pushes the trail past the last
+    // column, stranding the lead there.
+    let mut s = Screen::new(1, 5);
+    put(&mut s, 0, "ab漢");
+    assert_eq!(row_widths(&s, 0), "S S L T S");
+    s.cursor_goto(0, 0);
+    s.insert_chars(2);
+    assert_eq!(row_widths(&s, 0), "S S S S S");
+    assert_eq!(grid_text(&s, 0), "  ab");
+    assert_pairs_intact(&s, "ICH 2");
+}
+
+#[test]
+fn ech_over_a_wide_lead_leaves_no_orphan_trail() {
+    // `\x1b[H\x1b[3X`: the span ends between the lead and its trail.
+    let mut s = wide_pair_row();
+    s.cursor_goto(0, 0);
+    s.erase_chars(3);
+    assert_eq!(row_widths(&s, 0), "S S S S S S S S");
+    assert_eq!(grid_text(&s, 0), "    cd");
+    assert_pairs_intact(&s, "ECH 3");
+}
+
+#[test]
+fn ech_from_a_wide_trail_leaves_no_orphan_lead() {
+    // `\x1b[4G\x1b[2X`: the span starts on the trail, stranding the lead.
+    let mut s = wide_pair_row();
+    s.cursor_goto(0, 3);
+    s.erase_chars(2);
+    assert_eq!(row_widths(&s, 0), "S S S S S S S S");
+    assert_eq!(grid_text(&s, 0), "ab   d");
+    assert_pairs_intact(&s, "ECH 2 from trail");
+}
+
+#[test]
+fn el_to_end_from_a_wide_trail_leaves_no_orphan_lead() {
+    // `\x1b[4G\x1b[0K`.
+    let mut s = wide_pair_row();
+    s.cursor_goto(0, 3);
+    s.erase_in_line(EraseMode::ToEnd);
+    assert_eq!(row_widths(&s, 0), "S S S S S S S S");
+    assert_eq!(grid_text(&s, 0), "ab");
+    assert_pairs_intact(&s, "EL ToEnd from trail");
+}
+
+#[test]
+fn el_to_start_over_a_wide_lead_leaves_no_orphan_trail() {
+    // `\x1b[3G\x1b[1K`.
+    let mut s = wide_pair_row();
+    s.cursor_goto(0, 2);
+    s.erase_in_line(EraseMode::ToStart);
+    assert_eq!(row_widths(&s, 0), "S S S S S S S S");
+    assert_eq!(grid_text(&s, 0), "    cd");
+    assert_pairs_intact(&s, "EL ToStart over lead");
+}
+
+#[test]
+fn ed_to_end_from_a_wide_trail_leaves_no_orphan_lead() {
+    // ED delegates the cursor row to EL, so it inherits the same cut.
+    let mut s = Screen::new(2, 8);
+    put(&mut s, 0, "ab漢cd");
+    put(&mut s, 1, "zz");
+    s.cursor_goto(0, 3);
+    s.erase_in_display(EraseMode::ToEnd);
+    assert_eq!(row_widths(&s, 0), "S S S S S S S S");
+    assert_eq!(grid_text(&s, 0), "ab");
+    assert_eq!(grid_text(&s, 1), "");
+    assert_pairs_intact(&s, "ED ToEnd from trail");
+}
+
+#[test]
+fn ed_to_start_over_a_wide_lead_leaves_no_orphan_trail() {
+    let mut s = Screen::new(2, 8);
+    put(&mut s, 0, "zz");
+    put(&mut s, 1, "ab漢cd");
+    s.cursor_goto(1, 2);
+    s.erase_in_display(EraseMode::ToStart);
+    assert_eq!(row_widths(&s, 1), "S S S S S S S S");
+    assert_eq!(grid_text(&s, 0), "");
+    assert_eq!(grid_text(&s, 1), "    cd");
+    assert_pairs_intact(&s, "ED ToStart over lead");
+}
+
+#[test]
+fn wrap_spacer_cleans_the_pair_it_overwrites() {
+    // A wide char that does not fit drops a spacer in the last column
+    // before wrapping. If that column was a trail, its lead is stranded.
+    let mut s = Screen::new(2, 3);
+    s.print('a');
+    s.print('你'); // occupies columns 1-2
+    assert_eq!(row_widths(&s, 0), "S L T");
+    s.cursor_goto(0, 2); // park on the trail, clearing pending wrap
+    s.print('好'); // needs two columns, only one left: spacer + wrap
+    assert_eq!(row_widths(&s, 0), "S S S");
+    assert_eq!(grid_text(&s, 0), "a");
+    assert_eq!(grid_text(&s, 1), "好");
+    assert_pairs_intact(&s, "wrap spacer");
+}
+
+#[test]
+fn insert_mode_print_over_a_wide_pair_leaves_no_orphan() {
+    let mut s = Screen::new(1, 6);
+    put(&mut s, 0, "a漢b");
+    s.cursor_goto(0, 1); // on the lead
+    s.set_insert_mode(true);
+    s.print('x');
+    assert_pairs_intact(&s, "IRM print over lead");
+    s.cursor_goto(0, 2);
+    s.print('你'); // wide insert, pushes the row end off
+    assert_pairs_intact(&s, "IRM wide print");
+}
+
+#[test]
+fn wide_pair_invariant_survives_a_randomized_op_storm() {
+    // Deterministic xorshift: no dev-dependency, same sequence every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let mut s = Screen::with_scrollback(6, 9, 40);
+    // A mix of narrow, wide, and combining characters.
+    let alphabet = ['a', 'Z', '漢', '你', '好', ' ', '\u{0301}', 'e'];
+
+    for step in 0..20_000 {
+        let rows = s.rows();
+        let cols = s.cols();
+        let row = rng.below(rows);
+        let col = rng.below(cols);
+        let n = rng.below(cols + 2);
+        let mode = match rng.below(3) {
+            0 => EraseMode::ToEnd,
+            1 => EraseMode::ToStart,
+            _ => EraseMode::All,
+        };
+        let op = rng.below(22);
+        match op {
+            0 => {
+                s.cursor_goto(row, col);
+                s.print(alphabet[rng.below(alphabet.len())]);
+            }
+            1 => s.print(alphabet[rng.below(alphabet.len())]),
+            2 => {
+                s.cursor_goto(row, col);
+                s.erase_chars(n);
+            }
+            3 => {
+                s.cursor_goto(row, col);
+                s.insert_chars(n);
+            }
+            4 => {
+                s.cursor_goto(row, col);
+                s.delete_chars(n);
+            }
+            5 => {
+                s.cursor_goto(row, col);
+                s.erase_in_line(mode);
+            }
+            6 => {
+                s.cursor_goto(row, col);
+                s.erase_in_display(mode);
+            }
+            7 => {
+                s.cursor_goto(row, col);
+                s.insert_lines(n);
+            }
+            8 => {
+                s.cursor_goto(row, col);
+                s.delete_lines(n);
+            }
+            9 => s.scroll_up(n),
+            10 => s.scroll_down(n),
+            11 => s.linefeed(),
+            12 => s.carriage_return(),
+            13 => s.tab(),
+            14 => s.back_tab(),
+            15 => s.set_insert_mode(rng.below(2) == 0),
+            16 => s.set_autowrap(rng.below(2) == 0),
+            17 => {
+                if rng.below(2) == 0 {
+                    s.enter_alt_screen();
+                } else {
+                    s.exit_alt_screen();
+                }
+            }
+            18 => s.resize(1 + rng.below(7), 1 + rng.below(10)),
+            19 => s.soft_reset(),
+            20 => s.erase_scrollback(),
+            _ => {
+                if rng.below(2) == 0 {
+                    s.save_cursor();
+                } else {
+                    s.restore_cursor();
+                }
+            }
+        }
+        assert_pairs_intact(&s, &format!("step {step} (op {op})"));
+        // Cursors must stay addressable no matter what the storm did.
+        assert!(s.cursor().row < s.rows());
+        assert!(s.cursor().col < s.cols());
+    }
 }
 
 #[test]
@@ -558,6 +869,108 @@ fn erase_all_on_primary_pushes_screen_to_scrollback() {
 }
 
 #[test]
+fn erase_all_pushes_only_the_rows_that_hold_content() {
+    // A 24-row screen with two lines of output costs two scrollback rows,
+    // not twenty-four.
+    let mut s = Screen::with_scrollback(24, 20, 10_000);
+    put(&mut s, 0, "$ echo hi");
+    put(&mut s, 1, "hi");
+    s.cursor_goto(0, 0);
+    s.erase_in_display(EraseMode::All);
+    assert_eq!(s.scrollback().len(), 2);
+    assert_eq!(s.row_text(0).as_deref(), Some("$ echo hi"));
+    assert_eq!(s.row_text(1).as_deref(), Some("hi"));
+}
+
+#[test]
+fn erase_all_on_a_blank_screen_pushes_nothing() {
+    let mut s = Screen::with_scrollback(24, 20, 10_000);
+    s.erase_in_display(EraseMode::All);
+    s.erase_in_display(EraseMode::All);
+    assert!(s.scrollback().is_empty());
+    assert_eq!(s.scrollback().evicted(), 0);
+}
+
+#[test]
+fn erase_all_keeps_a_row_painted_with_a_background_color() {
+    // "Blank" means every cell is exactly the default. A screen painted
+    // with a background is content and must survive as history.
+    let mut s = Screen::with_scrollback(3, 4, 100);
+    s.pen_mut().bg = Color::Indexed(4);
+    s.cursor_goto(1, 0);
+    s.erase_in_line(EraseMode::All); // paints row 1, leaves 0 and 2 default
+    s.erase_in_display(EraseMode::All);
+    assert_eq!(s.scrollback().len(), 2); // rows 0..=1; row 2 is still blank
+    assert_eq!(
+        s.scrollback().row(1).unwrap()[0].attrs.bg,
+        Color::Indexed(4)
+    );
+}
+
+#[test]
+fn repeated_clear_costs_content_not_screenfuls() {
+    // The regression that made this matter: `clear` on a 24-row screen
+    // used to spend 24 scrollback rows every single time, so a few hundred
+    // invocations evicted every real line of history behind a wall of
+    // blanks. Cost must be O(content), not O(clears × rows).
+    let rows = 24;
+    let clears = 300;
+    let mut s = Screen::with_scrollback(rows, 40, 10_000);
+    for i in 0..clears {
+        put(&mut s, 0, &format!("real output {i}"));
+        s.cursor_goto(0, 0);
+        s.erase_in_display(EraseMode::All); // `ESC[2J` as `clear` sends it
+    }
+
+    // Exactly one row per line of real output, and nothing evicted.
+    assert_eq!(s.scrollback().len(), clears);
+    assert_eq!(s.scrollback().evicted(), 0);
+    for i in 0..clears {
+        assert_eq!(
+            s.row_text(i).as_deref(),
+            Some(format!("real output {i}").as_str()),
+            "output from clear #{i} is unrecoverable"
+        );
+    }
+    // Not one blank row made it into history.
+    for i in 0..s.scrollback().len() {
+        let row = s.scrollback().row(i).unwrap();
+        assert!(
+            row.iter().any(|c| c.ch != ' '),
+            "scrollback row {i} is a blank screen row"
+        );
+    }
+}
+
+#[test]
+fn clear_with_e3_drops_history_and_keeps_ids_monotonic() {
+    // `clear` with the E3 capability: `ESC[3J` then `ESC[H ESC[2J`.
+    let mut s = Screen::with_scrollback(24, 40, 10_000);
+    for i in 0..50 {
+        put(&mut s, 0, &format!("line {i}"));
+        s.erase_scrollback();
+        s.cursor_goto(0, 0);
+        s.erase_in_display(EraseMode::All);
+    }
+    // Each round wiped the previous round's history and filed one row of
+    // its own, so history never grows without bound...
+    assert_eq!(s.scrollback().len(), 1);
+    assert_eq!(s.row_text(49).as_deref(), Some("line 49"));
+    // ...and every id the wiped rows held is spent forever, never reused.
+    assert_eq!(s.scrollback().evicted(), 49);
+    assert!(s.line(0).is_none());
+    assert!(s.line(48).is_none());
+
+    // Wiping the last retained row moves no id: the grid keeps its own.
+    let grid_zero = s.absolute_row(0);
+    s.erase_scrollback();
+    assert!(s.scrollback().is_empty());
+    assert_eq!(s.scrollback().evicted(), 50);
+    assert_eq!(s.absolute_row(0), grid_zero);
+    assert!(s.line(49).is_none());
+}
+
+#[test]
 fn erase_all_on_alt_screen_does_not_touch_scrollback() {
     let mut s = Screen::new(2, 3);
     s.enter_alt_screen();
@@ -778,7 +1191,7 @@ fn alt_screen_is_isolated_from_primary() {
 #[test]
 fn absolute_rows_address_the_primary_grid_while_alt_is_active() {
     let mut s = Screen::with_scrollback(3, 12, 10);
-    put(&mut s, 0, "$ vim notes");
+    put(&mut s, 0, "$ vim");
     put(&mut s, 1, "opening");
     put(&mut s, 2, "reading");
     let abs = [s.absolute_row(0), s.absolute_row(1), s.absolute_row(2)];
@@ -793,7 +1206,7 @@ fn absolute_rows_address_the_primary_grid_while_alt_is_active() {
     assert_eq!(active_text(&s, 2), "ALTUI three");
 
     // Absolute rows are the scrollback timeline: still the primary screen.
-    assert_eq!(s.row_text(abs[0]).as_deref(), Some("$ vim notes"));
+    assert_eq!(s.row_text(abs[0]).as_deref(), Some("$ vim"));
     assert_eq!(s.row_text(abs[1]).as_deref(), Some("opening"));
     assert_eq!(s.row_text(abs[2]).as_deref(), Some("reading"));
     assert_eq!(s.line(abs[1]).unwrap()[0].ch, 'o');
@@ -810,7 +1223,7 @@ fn absolute_rows_address_the_primary_grid_while_alt_is_active() {
     assert_eq!(s.primary_grid().cell(1, 0).unwrap().ch, 'o');
 
     s.exit_alt_screen();
-    assert_eq!(active_text(&s, 0), "$ vim notes"); // primary restored
+    assert_eq!(active_text(&s, 0), "$ vim"); // primary restored
     assert_eq!(s.row_text(abs[2]).as_deref(), Some("reading"));
 }
 
@@ -984,13 +1397,13 @@ fn viewport_rows_omits_evicted_rows() {
 fn resize_preserves_content_and_keeps_scrollback() {
     let mut s = Screen::with_scrollback(2, 3, 10);
     put(&mut s, 0, "aaa");
-    s.erase_in_display(EraseMode::All); // pushes 2 rows to scrollback
+    s.erase_in_display(EraseMode::All); // pushes the one row that held text
     put(&mut s, 0, "new");
     s.cursor_goto(1, 2);
     s.set_scroll_region(1, 2);
     s.resize(4, 8);
     assert_eq!((s.rows(), s.cols()), (4, 8));
-    assert_eq!(s.scrollback().len(), 2);
+    assert_eq!(s.scrollback().len(), 1);
     assert_eq!(s.row_text(0).unwrap(), "aaa");
     assert_eq!(s.scroll_region(), (0, 3));
     assert_eq!(grid_text(&s, 0), "new"); // on-screen content survives
@@ -1064,25 +1477,57 @@ fn resize_shrinking_rows_sheds_the_top_into_scrollback() {
 }
 
 #[test]
-fn resize_shrinking_rows_drops_the_bottom_when_the_cursor_already_fits() {
+fn resize_shrinking_rows_never_drops_content_off_the_bottom() {
+    // The cursor fitting in the new height is not enough: rows *below* it
+    // still hold output, and a shrink must not silently delete them.
     let mut s = Screen::with_scrollback(4, 4, 10);
     put(&mut s, 0, "aaa");
     put(&mut s, 1, "bbb");
     put(&mut s, 2, "ccc");
     put(&mut s, 3, "ddd");
+    let abs: Vec<usize> = (0..4).map(|r| s.absolute_row(r)).collect();
+    s.cursor_goto(1, 2);
+
+    s.resize(2, 4);
+    // Two rows had to leave the top to keep "ccc"/"ddd" on a 2-row screen.
+    assert_eq!(s.scrollback().len(), 2);
+    assert_eq!(s.scrollback().evicted(), 0);
+    // Every row is still addressable at the id it always had.
+    for (r, &a) in abs.iter().enumerate() {
+        assert_eq!(
+            s.row_text(a).as_deref(),
+            Some(["aaa", "bbb", "ccc", "ddd"][r]),
+            "absolute row {a}"
+        );
+    }
+    assert_eq!(active_text(&s, 0), "ccc");
+    assert_eq!(active_text(&s, 1), "ddd");
+    // The cursor's own row went to scrollback, and a cursor cannot point
+    // into history, so it lands on the topmost row that survived.
+    assert_eq!((s.cursor().row, s.cursor().col), (0, 2));
+    assert_eq!(s.cursor_absolute_row(), s.absolute_row(0));
+}
+
+#[test]
+fn resize_shrinking_rows_discards_only_blank_trailing_rows() {
+    // Mirror image: the rows that no longer fit are genuinely blank, so
+    // they can just go — nothing reaches scrollback and no id moves.
+    let mut s = Screen::with_scrollback(4, 4, 10);
+    put(&mut s, 0, "aaa");
+    put(&mut s, 1, "bbb"); // rows 2 and 3 stay blank
     s.cursor_goto(1, 2);
     let cursor_abs = s.cursor_absolute_row();
 
     s.resize(2, 4);
     assert!(s.scrollback().is_empty()); // nothing had to leave the top
-    assert_eq!(grid_text(&s, 0), "aaa"); // content at and above the cursor kept
+    assert_eq!(grid_text(&s, 0), "aaa");
     assert_eq!(grid_text(&s, 1), "bbb");
     assert_eq!((s.cursor().row, s.cursor().col), (1, 2));
     assert_eq!(s.cursor_absolute_row(), cursor_abs);
 }
 
 #[test]
-fn resize_on_the_alt_screen_never_feeds_scrollback() {
+fn resize_on_the_alt_screen_sheds_only_the_primarys_own_rows() {
     let mut s = Screen::with_scrollback(4, 8, 10);
     put(&mut s, 0, "p-zero");
     put(&mut s, 1, "p-one");
@@ -1093,22 +1538,93 @@ fn resize_on_the_alt_screen_never_feeds_scrollback() {
     put(&mut s, 1, "a-one");
     put(&mut s, 2, "a-two");
     put(&mut s, 3, "a-three");
-    s.cursor_goto(3, 0); // forces a top shed
+    s.cursor_goto(3, 0);
 
     s.resize(2, 8);
     // The alt grid kept its own bottom, and lost its top without a trace.
     assert_eq!(active_text(&s, 0), "a-two");
     assert_eq!(active_text(&s, 1), "a-three");
-    // Only the primary grid's shed rows reached scrollback.
+    // Scrollback holds the primary's own rows and nothing else: the two
+    // that no longer fit, still under the ids they were born with.
     assert_eq!(s.scrollback().len(), 2);
+    assert_eq!(s.scrollback().evicted(), 0);
     assert_eq!(s.row_text(0).as_deref(), Some("p-zero"));
     assert_eq!(s.row_text(1).as_deref(), Some("p-one"));
     assert_eq!(s.row_text(2).as_deref(), Some("p-two"));
     assert_eq!(s.row_text(3).as_deref(), Some("p-three"));
+    for i in 0..s.scrollback().len() {
+        let text: String = s
+            .scrollback()
+            .row(i)
+            .unwrap()
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(!text.contains("a-"), "alt content leaked into scrollback");
+    }
     // Each grid preserved its own content.
     s.exit_alt_screen();
     assert_eq!(active_text(&s, 0), "p-two");
     assert_eq!(active_text(&s, 1), "p-three");
+}
+
+#[test]
+fn resize_on_the_alt_screen_never_feeds_scrollback() {
+    // The name means what it says: when the primary's own content still
+    // fits, an alt-screen resize touches neither scrollback nor absolute
+    // ids — no matter where the running application parked its cursor.
+    let mut s = Screen::with_scrollback(10, 10, 1000);
+    put(&mut s, 0, "$ vim");
+    s.cursor_goto(1, 0);
+    let abs_zero = s.absolute_row(0);
+
+    s.enter_alt_screen();
+    s.cursor_goto(9, 0); // the app parks its cursor on the bottom row
+    put(&mut s, 9, "~");
+    s.resize(4, 10);
+
+    assert!(s.scrollback().is_empty());
+    assert_eq!(s.scrollback().evicted(), 0);
+    assert_eq!(s.absolute_row(0), abs_zero); // the timeline did not move
+    assert_eq!(s.row_text(abs_zero).as_deref(), Some("$ vim"));
+    assert_eq!(s.total_rows(), 4);
+    // The alt grid still sheds its own top to keep its own cursor on
+    // screen; it simply has nowhere to file the rows it drops.
+    assert_eq!(active_text(&s, 3), "~");
+    s.exit_alt_screen();
+    assert_eq!(active_text(&s, 0), "$ vim");
+}
+
+#[test]
+fn resize_while_alt_is_up_keeps_the_shell_output_underneath() {
+    // Shrinking the window while a full-screen app is running used to
+    // delete the shell output behind it: the alt cursor sat at the top, so
+    // nothing was shed, and the primary rows that no longer fit fell off
+    // the bottom without ever reaching scrollback.
+    let mut s = Screen::with_scrollback(10, 10, 1000);
+    for r in 0..10 {
+        put(&mut s, r, &format!("out {r}"));
+    }
+    let abs: Vec<usize> = (0..10).map(|r| s.absolute_row(r)).collect();
+
+    s.enter_alt_screen(); // `\x1b[?1049h`
+    s.cursor_goto(0, 0); // `\x1b[1;1H`
+    s.resize(4, 10);
+
+    // Every line of shell output is still addressable at its own id.
+    for (r, &a) in abs.iter().enumerate() {
+        assert_eq!(
+            s.row_text(a).as_deref(),
+            Some(format!("out {r}").as_str()),
+            "absolute row {a}"
+        );
+    }
+    assert_eq!(s.scrollback().len(), 6);
+    assert_eq!(s.scrollback().evicted(), 0);
+
+    s.exit_alt_screen();
+    assert_eq!(active_text(&s, 0), "out 6");
+    assert_eq!(active_text(&s, 3), "out 9");
 }
 
 #[test]
@@ -1151,10 +1667,17 @@ fn resize_heals_a_wide_pair_split_by_the_new_right_edge() {
 }
 
 #[test]
-fn resize_never_moves_the_cursors_absolute_row() {
-    // Downstream block lists key off `cursor_absolute_row`, so a resize
-    // must never renumber it: rows shed off the top move into scrollback,
+fn resize_never_renumbers_a_row_and_keeps_the_cursor_anchored() {
+    // Downstream block lists key off absolute row ids, so a resize must
+    // never renumber one: rows shed off the top move into scrollback,
     // which grows by exactly the same amount.
+    //
+    // `cursor_absolute_row` follows the same rule, with one honest
+    // exception. When the cursor sits *above* content that has to be
+    // preserved, its own row is shed into scrollback — and a cursor cannot
+    // point into history, so it lands on the topmost surviving row. That
+    // is exactly `absolute_row(0)`, so the cursor's id is always
+    // `max(before, absolute_row(0))`: unchanged whenever its row survived.
     for &(rows, cols) in &[
         (1_usize, 1_usize),
         (2, 4),
@@ -1170,11 +1693,22 @@ fn resize_never_moves_the_cursors_absolute_row() {
             }
             s.cursor_goto(cursor_row, 3);
             let before = s.cursor_absolute_row();
+            let abs: Vec<usize> = (0..6).map(|r| s.absolute_row(r)).collect();
+
             s.resize(rows, cols);
+
+            let what = format!("resize({rows}, {cols}) with the cursor on row {cursor_row}");
+            // No row was dropped: every id still resolves.
+            for &a in &abs {
+                assert!(
+                    s.row_text(a).is_some(),
+                    "{what}: absolute row {a} stopped resolving"
+                );
+            }
             assert_eq!(
                 s.cursor_absolute_row(),
-                before,
-                "resize({rows}, {cols}) with the cursor on row {cursor_row}"
+                before.max(s.absolute_row(0)),
+                "{what}"
             );
             assert!(s.cursor().row < s.rows());
             assert!(s.cursor().col < s.cols());
@@ -1251,7 +1785,7 @@ fn reset_restores_defaults_but_keeps_scrollback() {
     assert!(!s.insert_mode());
     assert_eq!(s.scroll_region(), (0, 2));
     assert_eq!(grid_text(&s, 0), ""); // grids cleared
-    assert_eq!(s.scrollback().len(), 3); // history survives RIS
+    assert_eq!(s.scrollback().len(), 1); // history survives RIS
     assert_eq!(s.row_text(0).unwrap(), "aaaa");
     // Saved cursor was discarded: restore falls back to defaults.
     s.cursor_goto(1, 1);
@@ -1260,6 +1794,259 @@ fn reset_restores_defaults_but_keeps_scrollback() {
     // Tab stops are back to defaults.
     s.tab();
     assert_eq!(s.cursor().col, 3); // 4 cols: no stop before last column
+}
+
+#[test]
+fn resize_growth_fills_the_new_area_with_the_pen_background() {
+    // Background-color-erase: xterm paints the area exposed by a resize
+    // with the current background, exactly like every other erase path.
+    let mut s = Screen::new(2, 3);
+    put(&mut s, 0, "ab");
+    s.pen_mut().bg = Color::Indexed(5);
+    s.pen_mut().bold = true; // must NOT carry into the new cells
+    s.resize(4, 5);
+    let new_col = s.grid().cell(0, 4).unwrap();
+    assert_eq!(new_col.ch, ' ');
+    assert_eq!(new_col.attrs.bg, Color::Indexed(5));
+    assert!(!new_col.attrs.bold);
+    let new_row = s.grid().cell(3, 0).unwrap();
+    assert_eq!(new_row.attrs.bg, Color::Indexed(5));
+    assert_eq!(grid_text(&s, 0), "ab"); // old content untouched
+}
+
+#[test]
+fn entering_the_alt_screen_clears_to_the_pen_background() {
+    let mut s = Screen::new(2, 3);
+    s.pen_mut().bg = Color::Indexed(2);
+    s.pen_mut().underline = true;
+    s.enter_alt_screen();
+    let cell = s.grid().cell(1, 1).unwrap();
+    assert_eq!(cell.ch, ' ');
+    assert_eq!(cell.attrs.bg, Color::Indexed(2));
+    assert!(!cell.attrs.underline);
+}
+
+// ---------------------------------------------------------------------------
+// Host-supplied geometry
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extreme_dimensions_are_clamped_rather_than_panicking() {
+    // Dimensions arrive from the host (a window resize, TIOCSWINSZ). They
+    // must cap, never overflow.
+    let s = Screen::new(usize::MAX, 2);
+    assert_eq!((s.rows(), s.cols()), (bb_terminal_model::Grid::MAX_ROWS, 2));
+    let s = Screen::new(2, usize::MAX);
+    assert_eq!((s.rows(), s.cols()), (2, bb_terminal_model::Grid::MAX_COLS));
+
+    let mut s = Screen::new(4, 4);
+    put(&mut s, 0, "keep");
+    s.resize(usize::MAX, 2);
+    assert_eq!((s.rows(), s.cols()), (bb_terminal_model::Grid::MAX_ROWS, 2));
+    s.resize(3, usize::MAX);
+    assert_eq!((s.rows(), s.cols()), (3, bb_terminal_model::Grid::MAX_COLS));
+    // Still a usable screen afterwards.
+    s.print('x');
+    assert!(s.cursor().col < s.cols());
+}
+
+#[test]
+fn an_absurd_viewport_neither_overflows_nor_spins() {
+    // The height must bound the *request*, not the work: a `usize::MAX`
+    // height once overflowed the allocator, and clamping the reservation
+    // alone would have left an unbounded scan behind it.
+    let mut s = Screen::with_scrollback(2, 2, 10);
+    for ch in "abcdef".chars() {
+        s.print(ch);
+    }
+    let all = s.viewport_rows(Viewport {
+        top: 0,
+        height: usize::MAX,
+    });
+    assert_eq!(all.len(), s.total_rows());
+    assert_eq!(all[0][0].ch, 'a');
+
+    // A `top` past the end, and a `top + height` that would overflow.
+    assert!(s
+        .viewport_rows(Viewport {
+            top: usize::MAX,
+            height: 4,
+        })
+        .is_empty());
+    assert_eq!(
+        s.viewport_rows(Viewport {
+            top: 1,
+            height: usize::MAX,
+        })
+        .len(),
+        s.total_rows() - 1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Erase saved lines (CSI 3 J), CBT, and DECSTR
+// ---------------------------------------------------------------------------
+
+#[test]
+fn erase_scrollback_drops_history_without_reusing_ids() {
+    let mut s = Screen::with_scrollback(2, 3, 10);
+    put(&mut s, 0, "aaa");
+    put(&mut s, 1, "bbb");
+    s.linefeed();
+    s.linefeed(); // "aaa" and "bbb" are now in scrollback
+    assert_eq!(s.scrollback().len(), 2);
+    let grid_zero = s.absolute_row(0);
+    let cursor_abs = s.cursor_absolute_row();
+
+    s.erase_scrollback();
+
+    assert!(s.scrollback().is_empty());
+    assert_eq!(s.scrollback().evicted(), 2); // ids 0 and 1 are spent
+    assert!(s.line(0).is_none());
+    assert!(s.line(1).is_none());
+    // The grid did not move: its rows keep the ids they already had.
+    assert_eq!(s.absolute_row(0), grid_zero);
+    assert_eq!(s.cursor_absolute_row(), cursor_abs);
+    assert_eq!(s.total_rows(), 2);
+    // New output lands after the spent ids, never on top of them.
+    put(&mut s, 0, "ccc");
+    assert_eq!(s.row_text(grid_zero).as_deref(), Some("ccc"));
+}
+
+#[test]
+fn erase_scrollback_leaves_the_screen_and_modes_alone() {
+    let mut s = Screen::with_scrollback(2, 4, 10);
+    put(&mut s, 0, "keep");
+    s.erase_in_display(EraseMode::All);
+    put(&mut s, 0, "live");
+    s.cursor_goto(1, 2);
+    s.set_insert_mode(true);
+    s.erase_scrollback();
+    assert_eq!(active_text(&s, 0), "live");
+    assert_eq!((s.cursor().row, s.cursor().col), (1, 2));
+    assert!(s.insert_mode());
+}
+
+#[test]
+fn back_tab_walks_back_through_tab_stops() {
+    let mut s = Screen::new(1, 20);
+    s.cursor_to_col(19);
+    s.back_tab();
+    assert_eq!(s.cursor().col, 16);
+    s.back_tab();
+    assert_eq!(s.cursor().col, 8);
+    s.back_tab();
+    assert_eq!(s.cursor().col, 0);
+    s.back_tab(); // already home: stays put
+    assert_eq!(s.cursor().col, 0);
+}
+
+#[test]
+fn back_tab_honors_the_screens_own_tab_stops() {
+    let mut s = Screen::new(1, 20);
+    s.clear_all_tab_stops();
+    s.cursor_to_col(5);
+    s.set_tab_stop();
+    s.cursor_to_col(12);
+    s.set_tab_stop();
+    s.cursor_to_col(19);
+    s.back_tab();
+    assert_eq!(s.cursor().col, 12);
+    s.back_tab();
+    assert_eq!(s.cursor().col, 5);
+    s.back_tab();
+    assert_eq!(s.cursor().col, 0); // no stop below 5
+}
+
+#[test]
+fn back_tab_is_the_inverse_of_tab_and_clears_pending_wrap() {
+    let mut s = Screen::new(1, 4);
+    for ch in "abcd".chars() {
+        s.print(ch);
+    }
+    assert!(s.pending_wrap());
+    s.back_tab();
+    assert!(!s.pending_wrap());
+    assert_eq!(s.cursor().col, 0);
+    s.tab();
+    let after_tab = s.cursor().col;
+    s.back_tab();
+    assert!(s.cursor().col < after_tab);
+}
+
+#[test]
+fn soft_reset_restores_modes_without_clearing_the_screen() {
+    let mut s = Screen::with_scrollback(4, 10, 10);
+    put(&mut s, 0, "keep me");
+    s.erase_in_display(EraseMode::All); // seed scrollback
+    put(&mut s, 0, "on screen");
+    s.pen_mut().bold = true;
+    s.pen_mut().bg = Color::Indexed(6);
+    s.set_origin_mode(true);
+    s.set_insert_mode(true);
+    s.set_autowrap(false);
+    s.set_scroll_region(2, 3);
+    s.set_cursor_visible(false);
+    s.cursor_goto(2, 4);
+    s.save_cursor();
+    s.cursor_goto(1, 1);
+    let scrollback_before = s.scrollback().len();
+    let cursor_before = (s.cursor().row, s.cursor().col);
+
+    s.soft_reset();
+
+    assert!(!s.origin_mode());
+    assert!(!s.insert_mode());
+    assert!(s.autowrap());
+    assert_eq!(s.scroll_region(), (0, 3));
+    assert_eq!(*s.pen(), CellAttrs::default());
+    assert!(s.cursor().visible);
+    assert!(!s.pending_wrap());
+    // Screen, scrollback, and cursor position are untouched.
+    assert_eq!(active_text(&s, 0), "on screen");
+    assert_eq!(s.scrollback().len(), scrollback_before);
+    assert_eq!(s.row_text(0).as_deref(), Some("keep me"));
+    assert_eq!((s.cursor().row, s.cursor().col), cursor_before);
+    // The saved cursor was dropped: DECRC now homes with a default pen.
+    s.restore_cursor();
+    assert_eq!((s.cursor().row, s.cursor().col), (0, 0));
+    assert_eq!(*s.pen(), CellAttrs::default());
+}
+
+#[test]
+fn soft_reset_keeps_tab_stops_and_the_alt_screen() {
+    let mut s = Screen::new(3, 20);
+    s.clear_all_tab_stops();
+    s.cursor_to_col(5);
+    s.set_tab_stop();
+    s.enter_alt_screen();
+    put(&mut s, 0, "alt");
+
+    s.soft_reset();
+
+    assert!(s.is_alt_screen()); // DECSTR does not leave the alt screen
+    assert_eq!(active_text(&s, 0), "alt");
+    s.cursor_to_col(0);
+    s.tab();
+    assert_eq!(s.cursor().col, 5); // custom tab stops survive
+}
+
+#[test]
+fn soft_reset_only_drops_the_active_screens_saved_cursor() {
+    let mut s = Screen::new(4, 4);
+    s.cursor_goto(1, 1);
+    s.save_cursor(); // primary slot
+    s.enter_alt_screen();
+    s.cursor_goto(2, 2);
+    s.save_cursor(); // alt slot
+    s.soft_reset(); // clears the alt slot only
+    s.cursor_goto(3, 3);
+    s.restore_cursor();
+    assert_eq!((s.cursor().row, s.cursor().col), (0, 0)); // alt slot gone
+    s.exit_alt_screen();
+    s.cursor_goto(3, 3);
+    s.restore_cursor();
+    assert_eq!((s.cursor().row, s.cursor().col), (1, 1)); // primary intact
 }
 
 // ---------------------------------------------------------------------------

@@ -1,11 +1,13 @@
 //! Integration tests for `bb-vt-parser`.
 //!
-//! Every input goes through [`run_positioned_dims`], which feeds the byte
-//! stream three ways — one-shot, byte-at-a-time, and in 3-byte chunks —
-//! and asserts that all three produce identical screen state and
-//! identical [`PositionedEvent`]s, *cursor positions included*. That
-//! makes chunk-boundary safety a property checked by *every* test, not
-//! just the dedicated split tests.
+//! Every input goes through [`run_split`], which feeds the byte stream
+//! three ways — one-shot, byte-at-a-time, and in 3-byte chunks — and
+//! asserts that all three produce identical screen state and identical
+//! [`PositionedEvent`]s, *cursor positions included*. That makes
+//! chunk-boundary safety a property checked by *every* test, not just the
+//! dedicated split tests. Tests that need the screen mutated mid-stream
+//! (a resize, say) call [`run_split`] directly, which keeps the guarantee
+//! across the mutation too.
 //!
 //! Tests that only care about *what* happened use [`run`], which maps the
 //! positioned events down to bare [`VtEvent`]s; tests about *where* an
@@ -16,36 +18,69 @@
 use bb_terminal_model::{Color, CursorShape, Screen};
 use bb_vt_parser::{Parser, PositionedEvent, VtEvent};
 
-/// Feed `bytes` into a fresh `rows x cols` screen, asserting that
-/// one-shot, byte-at-a-time, and 3-byte-chunk feeding are equivalent —
-/// same screen, same events, same event positions.
-fn run_positioned_dims(bytes: &[u8], rows: usize, cols: usize) -> (Screen, Vec<PositionedEvent>) {
-    // One-shot.
-    let mut p1 = Parser::new();
-    let mut s1 = Screen::new(rows, cols);
-    let ev1 = p1.feed(&mut s1, bytes);
+/// Feed `before`, apply `between` to the screen, then feed `after` —
+/// asserting that one-shot, byte-at-a-time, and 3-byte-chunk feeding are
+/// equivalent on both sides of the mutation: same screen, same events,
+/// same event positions.
+///
+/// Every other runner delegates here, so chunk-boundary safety is a
+/// property checked by *every* test rather than by dedicated split tests.
+fn run_split(
+    make_screen: impl Fn() -> Screen,
+    before: &[u8],
+    between: impl Fn(&mut Screen),
+    after: &[u8],
+) -> (Screen, Vec<PositionedEvent>) {
+    let once = |chunk: usize| {
+        let mut parser = Parser::new();
+        let mut screen = make_screen();
+        let mut events = Vec::new();
+        let mut feed = |screen: &mut Screen, events: &mut Vec<PositionedEvent>, part: &[u8]| {
+            if chunk == 0 {
+                events.extend(parser.feed(screen, part));
+            } else {
+                for piece in part.chunks(chunk) {
+                    events.extend(parser.feed(screen, piece));
+                }
+            }
+        };
+        feed(&mut screen, &mut events, before);
+        between(&mut screen);
+        feed(&mut screen, &mut events, after);
+        (screen, events)
+    };
 
-    // Byte at a time.
-    let mut p2 = Parser::new();
-    let mut s2 = Screen::new(rows, cols);
-    let mut ev2 = Vec::new();
-    for &b in bytes {
-        ev2.extend(p2.feed(&mut s2, &[b]));
+    let (s1, ev1) = once(0);
+    for chunk in [1, 3] {
+        let (other, ev) = once(chunk);
+        assert_eq!(s1, other, "screen mismatch at chunk size {chunk}");
+        assert_eq!(ev1, ev, "event mismatch at chunk size {chunk}");
     }
-    assert_eq!(s1, s2, "byte-at-a-time screen mismatch for {bytes:?}");
-    assert_eq!(ev1, ev2, "byte-at-a-time event mismatch for {bytes:?}");
-
-    // 3-byte chunks.
-    let mut p3 = Parser::new();
-    let mut s3 = Screen::new(rows, cols);
-    let mut ev3 = Vec::new();
-    for chunk in bytes.chunks(3) {
-        ev3.extend(p3.feed(&mut s3, chunk));
-    }
-    assert_eq!(s1, s3, "chunked screen mismatch for {bytes:?}");
-    assert_eq!(ev1, ev3, "chunked event mismatch for {bytes:?}");
-
     (s1, ev1)
+}
+
+/// Feed `bytes` into a fresh screen from `make_screen`, asserting that
+/// one-shot, byte-at-a-time, and 3-byte-chunk feeding are equivalent.
+fn run_with(make_screen: impl Fn() -> Screen, bytes: &[u8]) -> (Screen, Vec<PositionedEvent>) {
+    run_split(make_screen, bytes, |_| {}, b"")
+}
+
+/// [`run_with`] on a fresh `rows x cols` screen.
+fn run_positioned_dims(bytes: &[u8], rows: usize, cols: usize) -> (Screen, Vec<PositionedEvent>) {
+    run_with(|| Screen::new(rows, cols), bytes)
+}
+
+/// [`run_positioned_dims`] with an explicit scrollback capacity.
+fn run_scrollback_dims(
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    max_scrollback: usize,
+) -> (Screen, Vec<PositionedEvent>) {
+    run_with(
+        || Screen::with_scrollback(rows, cols, max_scrollback),
+        bytes,
+    )
 }
 
 /// [`run_positioned_dims`] on a default 24x80 screen.
@@ -354,6 +389,30 @@ fn tbc_clears_stops() {
     assert_eq!(pos(&s), (0, 0));
 }
 
+#[test]
+fn ht_and_cbt_agree_after_a_rows_only_resize() {
+    // The parser used to keep a private tab-stop mirror for CBT, rebuilt
+    // only when the COLUMN count changed. `Screen::resize` rebuilds its
+    // own stops unconditionally, so a rows-only resize desynchronized the
+    // two: HT walked the screen's rebuilt every-8 defaults while CBT still
+    // saw the custom stop the mirror had recorded (col 20 here). The
+    // mirror is gone; both now read the screen.
+    let make = || Screen::new(24, 40);
+    let before: &[u8] = b"\x1b[3g\x1b[1;21H\x1bH"; // clear all stops, HTS at col 20
+    let resize = |s: &mut Screen| s.resize(20, 40); // ROWS change only
+
+    let (s, _) = run_split(make, before, resize, b"\x1b[1;1H\t");
+    assert_eq!(pos(&s), (0, 8), "HT should use the rebuilt defaults");
+    let (s, _) = run_split(make, before, resize, b"\x1b[1;40H\x1b[Z");
+    assert_eq!(pos(&s), (0, 32), "CBT should use the rebuilt defaults");
+
+    // Without a resize the custom stop is of course still honored by both.
+    let (s, _) = run_split(make, before, |_| {}, b"\x1b[1;1H\t");
+    assert_eq!(pos(&s), (0, 20));
+    let (s, _) = run_split(make, before, |_| {}, b"\x1b[1;40H\x1b[Z");
+    assert_eq!(pos(&s), (0, 20));
+}
+
 // ---------------------------------------------------------------------
 // CSI editing
 // ---------------------------------------------------------------------
@@ -386,16 +445,79 @@ fn ed_2_clears_and_preserves_history() {
     for r in 0..24 {
         assert_eq!(text(&s, r), "");
     }
-    // The cleared screen was pushed to scrollback (rows still addressable).
-    assert_eq!(s.scrollback().len(), 24);
+    // The cleared screen was pushed to scrollback, so its rows are still
+    // addressable. Only the rows that held something become history —
+    // `Screen::erase_in_display` stops at the last non-blank row rather
+    // than pushing the full height of the window.
+    assert_eq!(s.scrollback().len(), 2);
     assert_eq!(s.row_text(0).as_deref(), Some("a"));
     assert_eq!(s.row_text(1).as_deref(), Some("b"));
 }
 
 #[test]
-fn ed_3_treated_as_full_clear() {
+fn ed_3_erases_scrollback_and_leaves_the_grid_alone() {
+    // `CSI 3 J` is xterm's "Erase Saved Lines": it drops the retained
+    // history and does NOT touch the visible screen. This test previously
+    // asserted the exact opposite (that 3J cleared the grid like 2J),
+    // which is what let `clear` shred scrollback — see
+    // `clear_sequence_does_not_bury_history_in_blank_scrollback`.
+    let (s, _) = run_dims(b"a\r\nb\r\nc\r\nd\x1b[3J", 2, 10);
+    // History is gone...
+    assert_eq!(s.scrollback().len(), 0);
+    // ...but the two on-screen rows are untouched.
+    assert_eq!(text(&s, 0), "c");
+    assert_eq!(text(&s, 1), "d");
+
+    // Absolute ids stay monotonic across the erase: the ids the two
+    // dropped rows held are never handed to the rows still on screen.
+    assert_eq!(s.scrollback().evicted(), 2);
+    assert_eq!(s.absolute_row(0), 2);
+    assert_eq!(s.row_text(0), None);
+    assert_eq!(s.row_text(1), None);
+    assert_eq!(s.row_text(2).as_deref(), Some("c"));
+
+    // With no scrollback to erase it is simply a no-op.
     let (s, _) = run(b"hello\x1b[3J");
-    assert_eq!(text(&s, 0), "");
+    assert_eq!(text(&s, 0), "hello");
+    assert_eq!(s.scrollback().len(), 0);
+}
+
+#[test]
+fn clear_sequence_does_not_bury_history_in_blank_scrollback() {
+    // `/usr/bin/clear` under TERM=xterm-256color emits exactly
+    // `ESC[3J ESC[H ESC[2J`. Mapping the 3J onto EraseMode::All made every
+    // `clear` push a *second*, blank screenful into scrollback: measured
+    // over 300 clears on a 24-row screen, all 10,000 retained rows were
+    // blank and 4,400 real rows had been evicted, unrecoverably.
+    let clear: &[u8] = b"\x1b[3J\x1b[H\x1b[2J";
+    let mut bytes = Vec::new();
+    for i in 0..300 {
+        bytes.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        bytes.extend_from_slice(clear);
+    }
+    let (s, _) = run_scrollback_dims(&bytes, 24, 80, 10_000);
+
+    // Erase-Saved-Lines leads the sequence, so only the screenful the
+    // trailing 2J pushed is ever retained — however many clears run.
+    let retained = s.scrollback().len();
+    assert!(
+        retained <= 24,
+        "scrollback grew to {retained} rows; blank screenfuls are accumulating"
+    );
+    // And the last real line of output is the oldest thing in it, rather
+    // than being buried under blanks or pushed out of the ring entirely.
+    assert_eq!(
+        s.row_text(s.scrollback().evicted()).as_deref(),
+        Some("line299")
+    );
+}
+
+#[test]
+fn el_3_is_undefined_and_ignored() {
+    // Only EL 0/1/2 are defined; `3` is an ED-only selector. It used to
+    // share ED's mapping and erase the whole line.
+    let (s, _) = run(b"abcdef\x1b[3K");
+    assert_eq!(text(&s, 0), "abcdef");
 }
 
 #[test]
@@ -567,6 +689,44 @@ fn decscusr_cursor_shapes() {
 }
 
 // ---------------------------------------------------------------------
+// DECSTR
+// ---------------------------------------------------------------------
+
+#[test]
+fn decstr_soft_reset() {
+    // `CSI ! p` used to be parsed and dropped: `csi_dispatch` bailed out
+    // on any intermediate other than SP (DECSCUSR). Shells send DECSTR to
+    // recover a wedged terminal, so the recovery path did nothing at all.
+    let (s, _) = run(b"\x1b[?6h\x1b[4h\x1b[3;6r\x1b[1;31m\x1b[?25l\x1b[!p");
+    assert!(!s.origin_mode());
+    assert!(!s.insert_mode());
+    assert_eq!(s.scroll_region(), (0, 23));
+    assert_eq!(*s.pen(), bb_terminal_model::CellAttrs::default());
+    assert!(s.cursor().visible);
+    assert!(!s.pending_wrap());
+
+    // It clears the pending-wrap flag: printing after a soft reset at the
+    // right margin overwrites the last column instead of wrapping.
+    let (s, _) = run_dims(b"abcde\x1b[!pX", 2, 5);
+    assert_eq!(text(&s, 0), "abcdX");
+    assert_eq!(text(&s, 1), "");
+
+    // It does NOT clear the screen or the scrollback.
+    let (s, _) = run_dims(b"gone\r\nkept\r\nalso\x1b[!p", 2, 10);
+    assert_eq!(text(&s, 0), "kept");
+    assert_eq!(text(&s, 1), "also");
+    assert_eq!(s.scrollback().len(), 1);
+    assert_eq!(s.row_text(0).as_deref(), Some("gone"));
+}
+
+#[test]
+fn decstr_requires_no_private_marker() {
+    // `CSI ? ! p` is not DECSTR; it must be parsed and ignored.
+    let (s, _) = run(b"\x1b[4h\x1b[?!p");
+    assert!(s.insert_mode());
+}
+
+// ---------------------------------------------------------------------
 // SGR
 // ---------------------------------------------------------------------
 
@@ -588,7 +748,10 @@ fn sgr_resets() {
     // Empty SGR = SGR 0.
     let (s, _) = run(b"\x1b[1;31m\x1b[m");
     assert_eq!(*s.pen(), bb_terminal_model::CellAttrs::default());
-    // 21 clears bold.
+    // 21 clears bold. KNOWN DIVERGENCE from xterm ctlseqs, which defines
+    // 21 as doubly-underlined; `CellAttrs` has no double-underline field,
+    // so we keep the older ECMA-48 bold-off reading rather than drop the
+    // parameter. See the note in `sgr.rs`.
     let (s, _) = run(b"\x1b[1m\x1b[21m");
     assert!(!s.pen().bold);
 }
@@ -699,6 +862,53 @@ fn private_marker_mid_params_ignored() {
     let (s, _) = run(b"\x1b[1?25lx"); // malformed: '?' after digits
     assert!(s.cursor().visible);
     assert_eq!(text(&s, 0), "x");
+}
+
+#[test]
+fn escape_intermediates_are_bounded() {
+    // `ESC` followed by a run of 0x20..=0x2F used to be pushed into the
+    // parser's intermediate buffer with no cap at all, so the live heap
+    // grew byte-for-byte with the input and stayed there until the Parser
+    // was dropped: 8 MiB of `/` cost 8,388,608 retained bytes. SPACE is in
+    // that range too, so ordinary padded output could trigger it.
+    //
+    // `Parser`'s derived Debug embeds the buffer, so an unbounded one is
+    // observable from outside the crate without an allocator hook.
+    for filler in [b'/', b' '] {
+        // Two intermediates is the cap, so this is the widest state the
+        // parser is ever allowed to be in mid-sequence.
+        let baseline = {
+            let mut screen = Screen::new(24, 80);
+            let mut parser = Parser::new();
+            parser.feed(&mut screen, &[0x1B, filler, filler]);
+            format!("{parser:?}")
+        };
+
+        let mut screen = Screen::new(24, 80);
+        let mut parser = Parser::new();
+        parser.feed(&mut screen, b"\x1b");
+        parser.feed(&mut screen, &vec![filler; 1 << 20]); // 1 MiB
+        assert_eq!(
+            format!("{parser:?}"),
+            baseline,
+            "{:?} intermediates were retained instead of capped",
+            char::from(filler),
+        );
+
+        // The sequence is still consumed correctly: its final byte ends
+        // it (and is ignored, since intermediates are present), and
+        // ordinary printing resumes immediately after.
+        parser.feed(&mut screen, b"0after");
+        assert_eq!(text(&screen, 0), "after");
+    }
+
+    // The screen-visible half of the same fix, run through the standard
+    // chunking-invariant harness: over-long intermediate runs are dropped
+    // without disturbing where the sequence ends.
+    for bytes in [&b"\x1b//////0after"[..], b"\x1b      0after"] {
+        let (s, _) = run(bytes);
+        assert_eq!(text(&s, 0), "after");
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1060,11 +1270,57 @@ fn dcs_content_discarded() {
 }
 
 #[test]
-fn dcs_ignores_embedded_controls_and_esc() {
-    // BEL and a lone ESC inside DCS do not terminate it; ESC ESC \ does.
-    let (s, ev) = run(b"\x1bPdata\x07more\x1b\x1b\\x");
+fn dcs_body_discards_c0_but_esc_cancels() {
+    // This test used to assert that a lone ESC inside a DCS did *not*
+    // terminate it — the divergence that let one stray `ESC P` wedge the
+    // parser forever. Per the DEC state diagram ESC is an "anywhere"
+    // transition: C0 bytes are part of the discarded payload, ESC is not.
+    let (s, ev) = run(b"\x1bPdata\x07more\x1b\\x");
+    assert!(ev.is_empty()); // the BEL was payload, not an alert
+    assert_eq!(text(&s, 0), "x");
+
+    // ESC ESC \ still lands in ground: the first ESC cancels the string,
+    // the second restarts the escape, and `\` is a lone ST (a no-op).
+    let (s, ev) = run(b"\x1bPdata\x1b\x1b\\x");
     assert!(ev.is_empty());
     assert_eq!(text(&s, 0), "x");
+
+    // The cancelling ESC hands its byte straight to the new sequence.
+    let (s, _) = run(b"\x1bPsixel\x1b[31mred");
+    assert_eq!(text(&s, 0), "red");
+    assert_eq!(s.pen().fg, Color::Indexed(1));
+}
+
+#[test]
+fn esc_cancels_every_control_string_type() {
+    // `\x1bPq\x1b[0mHELLO` used to leave row 0 empty; xterm prints HELLO.
+    for opener in [&b"\x1bPq"[..], b"\x1bX", b"\x1b^", b"\x1b_"] {
+        let mut bytes = opener.to_vec();
+        bytes.extend_from_slice(b"\x1b[0mHELLO");
+        let (s, _) = run(&bytes);
+        assert_eq!(text(&s, 0), "HELLO", "{opener:?} still swallowed output");
+    }
+}
+
+#[test]
+fn unterminated_control_string_recovers_at_the_next_escape() {
+    // A stray `ESC P` used to wedge the parser permanently: every later
+    // byte — kilobytes of output, the OSC 133 markers, the prompt — was
+    // discarded until a CAN/SUB/ST that a real shell never sends. The
+    // next ESC in the stream now cancels the string and recovers.
+    let mut bytes = b"\x1bPtruncated-sixel-payload".to_vec();
+    bytes.extend_from_slice(b"\x1b[0m"); // first ESC: the recovery point
+    bytes.extend(std::iter::repeat(b'o').take(8192));
+    bytes.extend_from_slice(b"\r\n\x1b]133;A\x07$ ");
+    let (s, ev) = run(&bytes);
+
+    // The prompt marker survived, ...
+    assert_eq!(ev, vec![VtEvent::PromptStart]);
+    // ... the 8 KiB of output is on screen (wrapped across 103 rows), ...
+    assert_eq!(s.row_text(0).as_deref(), Some("o".repeat(80).as_str()));
+    // ... and the prompt is on the last row (`row_text` trims blanks).
+    assert_eq!(text(&s, 23), "$");
+    assert_eq!(pos(&s), (23, 2));
 }
 
 #[test]

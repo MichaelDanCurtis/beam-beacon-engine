@@ -7,6 +7,16 @@ use crate::cell::Cell;
 /// The grid stores cells in row-major order. Out-of-bounds access returns
 /// `None` rather than panicking — this is a deliberate choice so callers
 /// can defensively check shape mismatches without unwrapping.
+///
+/// # Geometry limits
+///
+/// Dimensions come from the host (a window resize, a `TIOCSWINSZ`), so
+/// they are *untrusted input*. Every constructor and resize **clamps**
+/// them to [`Grid::MAX_ROWS`] × [`Grid::MAX_COLS`] instead of trusting
+/// them: an absurd request yields a capped grid rather than an integer
+/// overflow or an allocation the machine cannot serve. There is no lower
+/// clamp — a zero-sized grid is legal here (but not for
+/// [`crate::Screen`], which clamps up to `1 × 1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Grid {
@@ -16,12 +26,40 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// Largest number of rows a grid will allocate. Larger requests are
+    /// clamped to this. Chosen far above any real terminal geometry while
+    /// keeping `MAX_ROWS * MAX_COLS` a comfortably allocatable cell count.
+    pub const MAX_ROWS: usize = 4_096;
+
+    /// Largest number of columns a grid will allocate. Larger requests are
+    /// clamped to this. See [`Grid::MAX_ROWS`].
+    pub const MAX_COLS: usize = 4_096;
+
+    /// Clamp a requested geometry to what this crate will allocate,
+    /// returning `(rows, cols, cell_count)`.
+    ///
+    /// The per-dimension cap keeps the product far inside `usize`, so the
+    /// `checked_mul` can never actually fail; it is spelled out anyway so
+    /// that raising the constants can only ever degrade to an empty grid,
+    /// never to an overflow panic.
+    fn clamped(rows: usize, cols: usize) -> (usize, usize, usize) {
+        let rows = rows.min(Self::MAX_ROWS);
+        let cols = cols.min(Self::MAX_COLS);
+        match rows.checked_mul(cols) {
+            Some(cells) => (rows, cols, cells),
+            None => (0, 0, 0),
+        }
+    }
+
     /// Create a fresh blank grid of `rows × cols` cells.
+    ///
+    /// Dimensions are clamped to [`Grid::MAX_ROWS`] × [`Grid::MAX_COLS`].
     pub fn new(rows: usize, cols: usize) -> Self {
+        let (rows, cols, cells) = Self::clamped(rows, cols);
         Self {
             rows,
             cols,
-            cells: vec![Cell::default(); rows * cols],
+            cells: vec![Cell::default(); cells],
         }
     }
 
@@ -167,11 +205,14 @@ impl Grid {
     /// window resize to behave like a real terminal — on-screen text
     /// survives — want [`Grid::resize_preserving`] instead;
     /// [`crate::Screen::resize`] uses that one.
+    ///
+    /// Dimensions are clamped to [`Grid::MAX_ROWS`] × [`Grid::MAX_COLS`].
     pub fn resize(&mut self, rows: usize, cols: usize) {
+        let (rows, cols, cells) = Self::clamped(rows, cols);
         self.rows = rows;
         self.cols = cols;
         self.cells.clear();
-        self.cells.resize(rows * cols, Cell::default());
+        self.cells.resize(cells, Cell::default());
     }
 
     /// Resize the grid, **preserving the overlapping region**.
@@ -195,11 +236,14 @@ impl Grid {
     /// the rows they want to shed off the top with
     /// [`Grid::scroll_up_within`] — that also gives them a chance to copy
     /// those rows into scrollback.
+    ///
+    /// Dimensions are clamped to [`Grid::MAX_ROWS`] × [`Grid::MAX_COLS`].
     pub fn resize_preserving(&mut self, rows: usize, cols: usize, blank: Cell) {
+        let (rows, cols, len) = Self::clamped(rows, cols);
         if self.rows == rows && self.cols == cols {
             return;
         }
-        let mut cells = vec![blank; rows * cols];
+        let mut cells = vec![blank; len];
         let copy_rows = self.rows.min(rows);
         let copy_cols = self.cols.min(cols);
         for r in 0..copy_rows {
@@ -368,6 +412,32 @@ mod tests {
         let before = g.clone();
         g.resize_preserving(2, 2, Cell::default());
         assert_eq!(g, before);
+    }
+
+    #[test]
+    fn grid_clamps_extreme_dimensions_instead_of_overflowing() {
+        // Host-supplied geometry is untrusted: it must cap, never panic.
+        let g = Grid::new(usize::MAX, 2);
+        assert_eq!(g.dimensions(), (Grid::MAX_ROWS, 2));
+        assert_eq!(g.len(), Grid::MAX_ROWS * 2);
+        let g = Grid::new(2, usize::MAX);
+        assert_eq!(g.dimensions(), (2, Grid::MAX_COLS));
+        let g = Grid::new(usize::MAX, usize::MAX);
+        assert_eq!(g.dimensions(), (Grid::MAX_ROWS, Grid::MAX_COLS));
+        assert_eq!(g.len(), Grid::MAX_ROWS * Grid::MAX_COLS);
+    }
+
+    #[test]
+    fn grid_resize_clamps_extreme_dimensions() {
+        let mut g = Grid::new(2, 2);
+        g.resize(usize::MAX, 2);
+        assert_eq!(g.dimensions(), (Grid::MAX_ROWS, 2));
+
+        let mut g = grid_with_letters(2, 2);
+        g.resize_preserving(usize::MAX, 3, Cell::default());
+        assert_eq!(g.dimensions(), (Grid::MAX_ROWS, 3));
+        assert_eq!(g.cell(0, 0).unwrap().ch, 'A'); // content still preserved
+        assert_eq!(g.cell(Grid::MAX_ROWS - 1, 0).unwrap().ch, ' ');
     }
 
     #[test]

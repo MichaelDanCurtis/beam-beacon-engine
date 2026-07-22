@@ -16,10 +16,14 @@
 //! - `ESC` sequences (DECSC/DECRC, IND/NEL/RI, HTS, RIS, keypad and
 //!   charset designations)
 //! - CSI escape sequences (cursor positioning, editing, scrolling,
-//!   ANSI/DEC modes, SGR colors including 256-color and truecolor)
+//!   ANSI/DEC modes, `DECSTR` soft reset, SGR colors including
+//!   256-color and truecolor)
 //! - OSC sequences (titles, working directory, hyperlinks, the OSC 133
 //!   prompt protocol), terminated by `BEL` or `ST`
-//! - DCS / SOS / PM / APC passthrough (contents discarded safely)
+//! - DCS / SOS / PM / APC passthrough (contents discarded safely; as in
+//!   the DEC state diagram, a bare `ESC` cancels the string rather than
+//!   being swallowed by it, so an unterminated one cannot wedge the
+//!   stream)
 //! - Incremental UTF-8 decoding with chunk-boundary safety (invalid
 //!   bytes decode to U+FFFD)
 //!
@@ -223,10 +227,6 @@ pub struct Parser {
     // OSC collection.
     osc_buf: Vec<u8>,
     osc_overflow: bool,
-    // Tab-stop mirror used for CBT (the screen exposes no back-tab).
-    // Rebuilt from the every-8-columns default whenever the column count
-    // changes; kept in sync with the HTS / TBC sequences we forward.
-    tabs: Option<Vec<bool>>,
 }
 
 impl Parser {
@@ -266,7 +266,7 @@ impl Parser {
             State::OscString => self.on_osc_string(screen, events, b),
             State::OscEscape => self.on_osc_escape(screen, events, b),
             State::StringBody => self.on_string_body(b),
-            State::StringEscape => self.on_string_escape(b),
+            State::StringEscape => self.on_string_escape(screen, b),
         }
     }
 
@@ -305,7 +305,19 @@ impl Parser {
             0x18 | 0x1A => self.state = State::Ground,
             0x1B => self.enter_escape(),
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => Self::execute_ctrl(screen, b),
-            0x20..=0x2F => self.intermediates.push(b),
+            0x20..=0x2F => {
+                // Bounded exactly like the CSI intermediate path. Without
+                // a cap, `ESC` followed by a run of `0x20..=0x2F` (SPACE
+                // included, so ordinary padded output can do it by
+                // accident) grows this Vec byte-for-byte with the input
+                // and holds it until the Parser is dropped. Excess bytes
+                // are dropped; the sequence is still consumed through its
+                // final byte, which `esc_dispatch` then ignores because
+                // `intermediates` is non-empty.
+                if self.intermediates.len() < MAX_INTERMEDIATES {
+                    self.intermediates.push(b);
+                }
+            }
             0x30..=0x7E => self.esc_dispatch(screen, b),
             0x7F => {}
             0x80..=0xFF => self.state = State::Ground,
@@ -421,12 +433,20 @@ impl Parser {
         }
     }
 
-    fn on_string_escape(&mut self, b: u8) {
-        match b {
-            b'\\' => self.state = State::Ground, // ST terminates the string
-            0x1B => {}                           // stay: another potential ST
-            _ => self.state = State::StringBody,
-        }
+    fn on_string_escape(&mut self, screen: &mut Screen, b: u8) {
+        // `ESC` is an "anywhere" transition in the DEC ANSI parser: it
+        // cancels whatever sequence or control string is in progress, and
+        // then begins a fresh escape sequence that consumes this byte.
+        // Falling back into the string body instead (the old behavior)
+        // meant one stray `ESC P` from a buggy program wedged the terminal
+        // permanently, silently swallowing every later byte — prompts,
+        // command output, OSC 133 markers and all.
+        //
+        // The `\` of an `ST` needs no special case: `esc_dispatch` treats
+        // `ESC \` with nothing open as a no-op back to ground, which is
+        // exactly "the string ended here".
+        self.enter_escape();
+        self.on_escape(screen, b);
     }
 
     // -----------------------------------------------------------------
@@ -488,16 +508,8 @@ impl Parser {
                     screen.cursor_up(1);
                 }
             }
-            b'H' => {
-                // HTS
-                screen.set_tab_stop();
-                self.mirror_set_tab(screen);
-            }
-            b'c' => {
-                // RIS
-                screen.reset();
-                self.tabs = None;
-            }
+            b'H' => screen.set_tab_stop(), // HTS
+            b'c' => screen.reset(),        // RIS
             b'[' => {
                 self.csi_reset();
                 self.state = State::CsiParam;
@@ -557,9 +569,18 @@ impl Parser {
             self.end_param();
         }
         if !self.intermediates.is_empty() {
-            // DECSCUSR is the only intermediate form we act on.
-            if self.intermediates == [b' '] && f == b'q' && self.private.is_none() {
-                self.set_cursor_style(screen);
+            // Two intermediate forms carry meaning for us; the rest
+            // (DECRQM's `$p`, DECSCL's `"p`, ...) are parsed and ignored.
+            if self.private.is_none() {
+                match (self.intermediates.as_slice(), f) {
+                    // DECSCUSR — CSI Ps SP q
+                    ([b' '], b'q') => self.set_cursor_style(screen),
+                    // DECSTR — CSI ! p. Shells send this to recover a
+                    // wedged terminal, so a no-op here means the recovery
+                    // path silently does nothing.
+                    ([b'!'], b'p') => screen.soft_reset(),
+                    _ => {}
+                }
             }
             return;
         }
@@ -599,10 +620,26 @@ impl Parser {
                     screen.tab();
                 }
             }
-            b'Z' => self.back_tab(screen, self.p1(0)), // CBT
+            b'Z' => {
+                // CBT: back-tab `n` times against the screen's own stops.
+                // Column 0 is a fixed point, so stop early once we hit it.
+                for _ in 0..self.p1(0) {
+                    if screen.cursor().col == 0 {
+                        break;
+                    }
+                    screen.back_tab();
+                }
+            }
             b'J' => {
-                // ED (3 = "also clear scrollback" elsewhere; treated as 2)
-                if let Some(mode) = Self::erase_mode(self.p(0)) {
+                // ED. `CSI 3 J` is xterm's "Erase Saved Lines" (XTERM_ED
+                // 3): it DROPS the retained scrollback and leaves the grid
+                // alone — it is not a stronger `CSI 2 J`. `/usr/bin/clear`
+                // under `xterm-256color` emits `ESC[3J ESC[H ESC[2J`, so
+                // getting this backwards turns every `clear` into another
+                // screenful of blank scrollback that evicts real history.
+                if self.p(0) == 3 {
+                    screen.erase_scrollback();
+                } else if let Some(mode) = Self::erase_mode(self.p(0)) {
                     screen.erase_in_display(mode);
                 }
             }
@@ -631,11 +668,14 @@ impl Parser {
         }
     }
 
+    /// The erase extent shared by ED and EL. Only 0/1/2 are defined; `3`
+    /// is *not* an extent — for ED it selects "Erase Saved Lines"
+    /// (handled by the caller), and for EL it is undefined and ignored.
     fn erase_mode(p: u16) -> Option<EraseMode> {
         match p {
             0 => Some(EraseMode::ToEnd),
             1 => Some(EraseMode::ToStart),
-            2 | 3 => Some(EraseMode::All),
+            2 => Some(EraseMode::All),
             _ => None,
         }
     }
@@ -694,71 +734,23 @@ impl Parser {
     }
 
     // -----------------------------------------------------------------
-    // Tab-stop mirror (CBT support)
+    // Tab stops
+    //
+    // The screen owns the tab stops outright — the parser keeps no mirror.
+    // It used to, because the screen exposed no back-tab, and the two
+    // copies silently desynchronized: `Screen::resize` rebuilds its stops
+    // unconditionally, while the mirror was rebuilt only when the *column*
+    // count changed, so a rows-only resize left HT and CBT disagreeing
+    // about where the stops were.
     // -----------------------------------------------------------------
 
-    /// (Re)build the tab-stop mirror at the every-8-columns default when
-    /// missing or when the column count changed (the screen resets its
-    /// own stops on resize, so a width change invalidates the mirror).
-    fn ensure_tabs(&mut self, cols: usize) {
-        let stale = match &self.tabs {
-            Some(t) => t.len() != cols,
-            None => true,
-        };
-        if stale {
-            self.tabs = Some((0..cols).map(|c| c != 0 && c % 8 == 0).collect());
-        }
-    }
-
-    fn mirror_set_tab(&mut self, screen: &Screen) {
-        self.ensure_tabs(screen.cols());
-        let col = screen.cursor().col;
-        if let Some(tabs) = self.tabs.as_mut() {
-            if let Some(stop) = tabs.get_mut(col) {
-                *stop = true;
-            }
-        }
-    }
-
-    fn tab_clear(&mut self, screen: &mut Screen) {
+    /// TBC: clear the stop under the cursor (0) or every stop (3).
+    fn tab_clear(&self, screen: &mut Screen) {
         match self.p(0) {
-            0 => {
-                screen.clear_tab_stop();
-                self.ensure_tabs(screen.cols());
-                let col = screen.cursor().col;
-                if let Some(tabs) = self.tabs.as_mut() {
-                    if let Some(stop) = tabs.get_mut(col) {
-                        *stop = false;
-                    }
-                }
-            }
-            3 => {
-                screen.clear_all_tab_stops();
-                self.ensure_tabs(screen.cols());
-                if let Some(tabs) = self.tabs.as_mut() {
-                    for stop in tabs.iter_mut() {
-                        *stop = false;
-                    }
-                }
-            }
+            0 => screen.clear_tab_stop(),
+            3 => screen.clear_all_tab_stops(),
             _ => {}
         }
-    }
-
-    /// CBT: move the cursor back `n` tab stops (column 0 if none remain).
-    fn back_tab(&mut self, screen: &mut Screen, n: usize) {
-        self.ensure_tabs(screen.cols());
-        let Some(tabs) = self.tabs.as_ref() else {
-            return;
-        };
-        let mut col = screen.cursor().col;
-        for _ in 0..n {
-            col = (0..col)
-                .rev()
-                .find(|&c| tabs.get(c) == Some(&true))
-                .unwrap_or(0);
-        }
-        screen.cursor_to_col(col);
     }
 
     // -----------------------------------------------------------------
