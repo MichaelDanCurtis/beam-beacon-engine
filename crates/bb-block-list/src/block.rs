@@ -102,7 +102,14 @@ impl Block {
     }
 
     /// First absolute row of the block (the row the prompt was drawn on).
-    /// Inclusive, and stable forever.
+    /// Inclusive.
+    ///
+    /// Stable for as long as the block owns any rows. The one exception is
+    /// a block *every* row of which is reclaimed by a later block starting
+    /// before it (a cursor jump backwards): with nothing left to point at,
+    /// it collapses onto the reclaiming row as a zero-row record of the
+    /// command that ran. See the invariant on
+    /// [`BlockList`](crate::BlockList).
     pub fn start_row(&self) -> usize {
         self.start_row
     }

@@ -204,6 +204,31 @@ impl Session {
     ///   as-is; anything unparseable leaves the cwd unchanged;
     /// - [`VtEvent::Title`] → the session title.
     ///
+    /// # Events fired on the alternate screen
+    ///
+    /// Absolute rows are a coordinate on the **primary** timeline, which
+    /// the alternate screen does not advance: while a full-screen
+    /// application owns the display, `cursor_row` is wherever the app's
+    /// cursor happens to sit inside its own frame, reinterpreted as a row
+    /// of the shell's scrollback history. It is meaningless there, so
+    /// nothing row-addressed is dispatched from it:
+    ///
+    /// - **Prompt markers are ignored.** A TUI emitting `OSC 133;A` must
+    ///   not create or close blocks at primary rows — under the block
+    ///   list's row-reclaiming invariant that would truncate finished
+    ///   commands away.
+    /// - **`OSC 7` applies to the open block directly** rather than by
+    ///   row. A working directory reported from inside a TUI belongs to
+    ///   the command that is currently *running* — the one that launched
+    ///   it — which is exactly the open block. The session cwd is updated
+    ///   either way.
+    /// - [`VtEvent::Title`] and everything the host handles itself are
+    ///   unaffected; they carry no row.
+    ///
+    /// The screen state is sampled per escape sequence, not per call, so a
+    /// PTY read that both enters the alternate screen and carries later
+    /// markers is split correctly — see "chunking independence" below.
+    ///
     /// # Chunking independence
     ///
     /// Block boundaries do **not** depend on how the host split its PTY
@@ -232,44 +257,69 @@ impl Session {
             return Vec::new();
         }
 
-        let events = self.parser.feed(&mut self.screen, bytes);
-        for positioned in &events {
-            let row = positioned.cursor_row;
-            match &positioned.event {
-                VtEvent::PromptStart => {
-                    self.blocks.on_marker(PromptMarker::PromptStart, row);
-                }
-                VtEvent::CommandStart => {
-                    self.blocks.on_marker(PromptMarker::CommandStart, row);
-                }
-                VtEvent::CommandExecuted => {
-                    self.blocks.on_marker(PromptMarker::CommandExecuted, row);
-                }
-                VtEvent::CommandFinished { exit_code } => {
-                    self.blocks.on_marker(
-                        PromptMarker::CommandFinished {
-                            exit_code: *exit_code,
-                        },
-                        row,
-                    );
-                }
-                VtEvent::Title(title) => {
-                    self.title = Some(title.clone());
-                }
-                VtEvent::WorkingDirectory(url) => {
-                    if let Some(path) = parse_file_url_path(url) {
-                        self.blocks.set_cwd_at_row(row, &path);
-                        self.cwd = Some(path);
-                    }
-                }
-                // Bells, hyperlinks, and any future event kinds are the
-                // host UI's business; they pass through in the return
-                // value untouched.
-                _ => {}
+        let mut all = Vec::new();
+        for segment in escape_segments(bytes) {
+            let events = self.parser.feed(&mut self.screen, segment);
+            // Sampled *after* the segment, which is exactly when the
+            // segment's own events fired: a segment holds at most one
+            // escape sequence, and a sequence either switches screens (a
+            // CSI or RIS, which emits no event) or emits an event (an OSC,
+            // which cannot switch screens) — never both.
+            let alt_screen = self.screen.is_alt_screen();
+            for positioned in &events {
+                self.dispatch_event(positioned, alt_screen);
             }
+            all.extend(events);
         }
         self.blocks.observe_row(&self.screen);
-        events
+        all
+    }
+
+    /// Apply one parser event to the session's state.
+    ///
+    /// `alt_screen` is whether the alternate screen was active when the
+    /// event fired; see [`Session::feed_pty`] for why that changes how a
+    /// row-addressed event is handled.
+    fn dispatch_event(&mut self, positioned: &PositionedEvent, alt_screen: bool) {
+        let row = positioned.cursor_row;
+        match &positioned.event {
+            VtEvent::PromptStart if !alt_screen => {
+                self.blocks.on_marker(PromptMarker::PromptStart, row);
+            }
+            VtEvent::CommandStart if !alt_screen => {
+                self.blocks.on_marker(PromptMarker::CommandStart, row);
+            }
+            VtEvent::CommandExecuted if !alt_screen => {
+                self.blocks.on_marker(PromptMarker::CommandExecuted, row);
+            }
+            VtEvent::CommandFinished { exit_code } if !alt_screen => {
+                self.blocks.on_marker(
+                    PromptMarker::CommandFinished {
+                        exit_code: *exit_code,
+                    },
+                    row,
+                );
+            }
+            VtEvent::Title(title) => {
+                self.title = Some(title.clone());
+            }
+            VtEvent::WorkingDirectory(url) => {
+                if let Some(path) = parse_file_url_path(url) {
+                    if alt_screen {
+                        // No usable row: attribute to the running command.
+                        self.blocks.set_cwd(&path);
+                    } else {
+                        self.blocks.set_cwd_at_row(row, &path);
+                    }
+                    self.cwd = Some(path);
+                }
+            }
+            // Prompt markers that fired on the alternate screen land here
+            // and are dropped. Bells, hyperlinks, and any future event
+            // kinds are the host UI's business; they pass through in the
+            // return value untouched.
+            _ => {}
+        }
     }
 
     /// The terminal screen (grid, scrollback, cursor).
@@ -382,6 +432,40 @@ impl Session {
             .run_turn(&mut self.conversation, input, &tool_ctx, cancel, events_tx)
             .await
     }
+}
+
+/// Split `bytes` so that no segment contains more than one escape
+/// sequence: every `ESC` begins a new segment.
+///
+/// This is what lets [`Session::feed_pty`] know whether the alternate
+/// screen was active *at the instant each event fired* rather than merely
+/// at the end of the PTY read. Screens are switched by escape sequences
+/// (`CSI ? 1049 h` and friends, or `RIS`) and nothing else, and the parser
+/// recognises no 8-bit C1 controls, so an `ESC`-delimited segment can
+/// switch screens at most once — and if it does, it emits no event, since
+/// only OSC sequences emit events and a segment holds at most one
+/// sequence. Sampling `is_alt_screen()` once per segment is therefore
+/// exact.
+///
+/// The parser is chunk-independent, so splitting changes nothing about the
+/// screen state or the events produced: feeding the segments in order is
+/// byte-for-byte equivalent to feeding `bytes` whole.
+///
+/// Never yields an empty segment (`Parser::feed` on one is a no-op
+/// anyway), and yields exactly one segment for input with no `ESC` at all.
+fn escape_segments(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    const ESC: u8 = 0x1b;
+    let mut start = 0;
+    // `..=len` so the final segment is flushed after the last byte.
+    (0..=bytes.len()).filter_map(move |index| {
+        let boundary = index == bytes.len() || bytes.get(index) == Some(&ESC);
+        if !boundary || index == start {
+            return None;
+        }
+        let segment = bytes.get(start..index);
+        start = index;
+        segment
+    })
 }
 
 /// Extract a filesystem path from an OSC 7 `file://` URL, leniently.
@@ -586,6 +670,201 @@ mod tests {
         let mut empty = session();
         assert!(!empty.record_command_at_row(0, "nope"));
         assert!(empty.blocks().is_empty());
+    }
+
+    // -- Alternate screen -------------------------------------------------
+
+    /// Two finished commands plus a third still running (a TUI), which is
+    /// the open block.
+    fn session_running_a_tui() -> Session {
+        let mut s = session();
+        s.feed_pty(b"\x1b]133;A\x07$ one\r\n\x1b]133;C\x07out-1\r\nout-2\r\n\x1b]133;D;0\x07");
+        s.feed_pty(b"\x1b]133;A\x07$ vim\r\n\x1b]133;B\x07");
+        s.record_command("vim");
+        s.feed_pty(b"\x1b]133;C\x07");
+        assert_eq!(s.blocks().len(), 2);
+        assert_eq!(s.blocks().latest().unwrap().command(), Some("vim"));
+        s
+    }
+
+    #[test]
+    fn alt_screen_osc7_attributes_to_the_running_command() {
+        // A TUI reports its working directory from inside the alternate
+        // screen. Its cursor row is a coordinate in its own frame; read as
+        // a primary-timeline row it lands somewhere in the *first*
+        // command's output, and the cwd was written onto that long
+        // finished block.
+        let mut s = session_running_a_tui();
+        let finished = s.blocks().first().unwrap().id();
+        let running = s.blocks().latest().unwrap().id();
+
+        s.feed_pty(b"\x1b[?1049h");
+        assert!(s.screen().is_alt_screen());
+        s.feed_pty(b"\x1b[1;1H"); // vim homes its cursor: primary row 0
+        s.feed_pty(b"\x1b]7;file:///vim/project\x07");
+
+        assert_eq!(s.cwd(), Some("/vim/project"));
+        assert_eq!(s.blocks().get(finished).unwrap().cwd(), None);
+        assert_eq!(s.blocks().get(running).unwrap().cwd(), Some("/vim/project"));
+        s.blocks().assert_invariants();
+    }
+
+    #[test]
+    fn alt_screen_prompt_markers_do_not_touch_blocks() {
+        // A full-screen app emitting OSC 133 (its own inner shell, a
+        // status line, a stray transcript) must not create or close blocks
+        // at primary rows: under the block list's row-reclaiming
+        // invariant, a marker at a low row truncates finished commands.
+        let mut s = session_running_a_tui();
+        let before: Vec<(usize, Option<usize>)> = s
+            .blocks()
+            .blocks()
+            .map(|b| (b.start_row(), b.end_row()))
+            .collect();
+
+        s.feed_pty(b"\x1b[?1049h\x1b[1;1H");
+        for marker in [
+            &b"\x1b]133;A\x07"[..],
+            b"\x1b]133;B\x07",
+            b"\x1b]133;C\x07",
+            b"\x1b]133;D;1\x07",
+        ] {
+            s.feed_pty(marker);
+        }
+        s.feed_pty(b"\x1b[?1049l");
+
+        let after: Vec<(usize, Option<usize>)> = s
+            .blocks()
+            .blocks()
+            .map(|b| (b.start_row(), b.end_row()))
+            .collect();
+        assert_eq!(before, after, "alt-screen markers moved block extents");
+        assert_eq!(s.blocks().len(), 2);
+        // The real command is still running and still has no exit code.
+        let running = s.blocks().latest().unwrap();
+        assert_eq!(running.lifecycle(), BlockLifecycle::Running);
+        assert_eq!(running.exit_code(), None);
+
+        // Back on the primary screen the shell's own markers work again.
+        s.feed_pty(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+        assert_eq!(s.blocks().len(), 3);
+        assert_eq!(s.blocks().blocks().nth(1).unwrap().exit_code(), Some(0));
+        s.blocks().assert_invariants();
+    }
+
+    #[test]
+    fn alt_screen_state_is_sampled_per_sequence_not_per_read() {
+        // `$ vim<Enter>`: the shell's OSC 133;C and vim's screen switch
+        // routinely arrive in one read(2). The marker fired on the primary
+        // screen and must be honoured; checking the screen once after the
+        // whole feed would drop it.
+        let mut s = session();
+        s.feed_pty(b"\x1b]133;A\x07$ vim\r\n");
+        s.feed_pty(b"\x1b]133;C\x07\x1b[?1049h\x1b[1;1H\x1b]7;file:///proj\x07");
+        assert!(s.screen().is_alt_screen());
+        assert_eq!(s.blocks().len(), 1);
+        let block = s.blocks().latest().unwrap();
+        assert_eq!(block.lifecycle(), BlockLifecycle::Running);
+        assert_eq!(block.cwd(), Some("/proj"));
+
+        // ...and the same in reverse: vim leaves and the shell's markers
+        // in the same read fire on the primary screen.
+        s.feed_pty(b"\x1b[?1049l\x1b]133;D;0\x07\x1b]133;A\x07");
+        assert!(!s.screen().is_alt_screen());
+        assert_eq!(s.blocks().len(), 2);
+        assert_eq!(s.blocks().first().unwrap().exit_code(), Some(0));
+        s.blocks().assert_invariants();
+    }
+
+    #[test]
+    fn resize_while_the_alt_screen_is_up_cannot_corrupt_blocks() {
+        // Resizing under a full-screen app moves the cursor inside the alt
+        // grid, which `cursor_absolute_row()` reports as a primary row far
+        // behind the real one. The next marker used to claim that row and
+        // overlap every block in between.
+        let mut s = Session::new(SessionId("r".to_owned()), 24, 80);
+        for i in 0..4 {
+            s.feed_pty(b"\x1b]133;A\x07");
+            s.record_command(&format!("cmd {i}"));
+            s.feed_pty(format!("cmd {i}\r\n\x1b]133;C\x07out {i}\r\n\x1b]133;D;0\x07").as_bytes());
+        }
+        s.feed_pty(b"\x1b]133;A\x07$ top\r\n\x1b]133;C\x07");
+        let before = s.blocks().len();
+
+        s.feed_pty(b"\x1b[?1049h\x1b[1;1H");
+        s.resize(6, 80);
+        s.feed_pty(b"\x1b]133;A\x07\x1b]133;C\x07");
+        s.blocks().assert_invariants();
+        assert_eq!(
+            s.blocks().len(),
+            before,
+            "alt-screen markers created blocks"
+        );
+
+        s.feed_pty(b"\x1b[?1049l");
+        s.feed_pty(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+        s.blocks().assert_invariants();
+        // Every earlier command survived with its text intact.
+        for i in 0..4 {
+            assert_eq!(
+                s.blocks().search_metadata(&format!("cmd {i}")).len(),
+                1,
+                "command {i} was lost"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_segments_splits_at_every_escape_only() {
+        let split =
+            |bytes: &'static [u8]| -> Vec<&'static [u8]> { escape_segments(bytes).collect() };
+        assert_eq!(split(b""), Vec::<&[u8]>::new());
+        assert_eq!(split(b"plain text"), vec![&b"plain text"[..]]);
+        assert_eq!(
+            split(b"ab\x1b[?1049h\x1b]133;A\x07cd"),
+            vec![&b"ab"[..], b"\x1b[?1049h", b"\x1b]133;A\x07cd"]
+        );
+        // A leading escape must not produce an empty first segment.
+        assert_eq!(split(b"\x1bc"), vec![&b"\x1bc"[..]]);
+        assert_eq!(split(b"\x1b\x1b"), vec![&b"\x1b"[..], b"\x1b"]);
+        // Reassembling the segments reproduces the input exactly.
+        let bytes = b"\x1b]0;t\x07x\x1b[1;1Hy\x1b";
+        assert_eq!(split(bytes).concat(), bytes.to_vec());
+    }
+
+    #[test]
+    fn a_cursor_jump_before_the_prompt_keeps_blocks_disjoint() {
+        // The end-to-end shape of the block list's invariant: a `CUP`
+        // backwards followed by a prompt marker used to leave a zero-row
+        // block and a new block re-claiming rows two older blocks owned,
+        // so `block_at_row` answered with a stale block.
+        let mut s = session();
+        s.feed_pty(b"\x1b]133;A\x07$ one\r\n\x1b]133;C\x07one-A\r\none-B\r\n\x1b]133;D;0\x07");
+        s.feed_pty(b"\x1b]133;A\x07$ two\r\n\x1b]133;C\x07two-A\r\n");
+        assert_eq!(s.blocks().len(), 2);
+
+        s.feed_pty(b"\x1b[3;1H\x1b]133;A\x07");
+        s.blocks().assert_invariants();
+
+        let ranges: Vec<(usize, Option<usize>)> = s
+            .blocks()
+            .blocks()
+            .map(|b| (b.start_row(), b.end_row()))
+            .collect();
+        assert_eq!(ranges, vec![(0, Some(2)), (2, None)]);
+        // Row 2 belongs to the block that just claimed it, not the stale one.
+        let newest = s.blocks().latest().unwrap().id();
+        assert_eq!(s.blocks().block_at_row(2).unwrap().id(), newest);
+        // ...and no row is owned twice.
+        for row in 0..6 {
+            assert!(
+                s.blocks()
+                    .blocks()
+                    .filter(|b| b.start_row() <= row && b.end_row().map_or(true, |end| row < end))
+                    .count()
+                    <= 1
+            );
+        }
     }
 
     #[test]

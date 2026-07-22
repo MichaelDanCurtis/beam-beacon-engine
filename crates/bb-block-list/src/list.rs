@@ -8,8 +8,35 @@ use crate::block::{Block, BlockId, BlockLifecycle, PromptMarker};
 ///
 /// Blocks are created and closed by feeding prompt-protocol markers to
 /// [`BlockList::on_marker`]; at most one block (always the newest) is open
-/// at a time. Blocks are ordered oldest → newest, which is also ascending
-/// [`Block::start_row`] and ascending [`BlockId`] order.
+/// at a time. Blocks are ordered oldest → newest, which is also
+/// non-decreasing [`Block::start_row`] and strictly ascending [`BlockId`]
+/// order.
+///
+/// # Invariant
+///
+/// Terminal rows are a **finite, reusable** resource: when a prompt starts
+/// at absolute row `R`, every row from `R` onward is about to be
+/// overwritten on screen, so any older block's claim on those rows is
+/// void. The list therefore maintains, at all times:
+///
+/// 1. **No overlaps.** Every absolute row is owned by at most one block.
+/// 2. **Non-decreasing starts.** `blocks[i].start_row <=
+///    blocks[i + 1].start_row`, so list order *is* row order — which is
+///    what makes [`BlockList::next`] / [`BlockList::prev`] "jump to the
+///    next/previous command on screen".
+/// 3. **At most one open block**, and it is always the newest.
+/// 4. **Strictly ascending ids**, never reused (so [`BlockList::get`] can
+///    binary-search, and a pruned block's id simply stops resolving).
+///
+/// A block that is left owning **zero rows** and carrying no recorded
+/// command is not a block at all — nothing can be selected, copied or
+/// searched through it — and is dropped rather than retained forever.
+///
+/// Enforcement lives in exactly one place: every block is created through
+/// the private `start_block_at`, which reclaims the rows first. Both
+/// [`BlockList::on_marker`] and [`BlockList::observe_row`] go through it.
+/// [`BlockList::assert_invariants`] checks all four properties and is
+/// asserted after every mutation in debug builds.
 ///
 /// # Heuristic fallback (no shell integration)
 ///
@@ -46,14 +73,15 @@ impl BlockList {
     ///
     /// Semantics (OSC 133 prompt protocol):
     ///
-    /// - [`PromptMarker::PromptStart`] at row `R` closes any still-open
-    ///   block (`end_row = R`; a block still
+    /// - [`PromptMarker::PromptStart`] at row `R` reclaims every row from
+    ///   `R` onward (see the type-level invariant) and starts a new
+    ///   [`Prompt`](BlockLifecycle::Prompt) block at `start_row = R`. A
+    ///   still-open block is closed at `end_row = R`; if it was still
     ///   [`Running`](BlockLifecycle::Running) — a command that never
-    ///   reported `D` — becomes [`Finished`](BlockLifecycle::Finished) with
-    ///   `exit_code` left `None`) and starts a new
-    ///   [`Prompt`](BlockLifecycle::Prompt) block at `start_row = R`.
-    ///   A repeated `PromptStart` at the same row as the current prompt
-    ///   block (a shell redrawing its prompt) is ignored.
+    ///   reported `D` — it becomes [`Finished`](BlockLifecycle::Finished)
+    ///   with `exit_code` left `None`. A repeated `PromptStart` at the same
+    ///   row as the current prompt block (a shell redrawing its prompt) is
+    ///   ignored.
     /// - [`PromptMarker::CommandStart`] moves the current block to
     ///   [`Composing`](BlockLifecycle::Composing).
     /// - [`PromptMarker::CommandExecuted`] moves the current block to
@@ -62,28 +90,27 @@ impl BlockList {
     ///   [`Finished`](BlockLifecycle::Finished) and records the exit code.
     ///   The block's end stays open until the *next* `PromptStart` (Warp
     ///   semantics: the block visually includes the command's output, and
-    ///   the next prompt starts the next block).
+    ///   the next prompt starts the next block). With **no** open block it
+    ///   creates nothing — see the comment on that arm.
     ///
-    /// Degenerate marker orders never panic: a marker with no open block
-    /// creates a block at `cursor_abs_row` already in the implied state,
+    /// # Rows may go backwards
+    ///
+    /// `cursor_abs_row` is wherever the cursor happened to be, and nothing
+    /// stops it from being *before* the open block's start: a `CUP` before
+    /// the prompt, an alt-screen application emitting `OSC 133;A`, or a
+    /// resize that shifts the cursor all do it. Such a marker is handled
+    /// like any other — rows at or after `R` are reclaimed — so the list's
+    /// invariant holds for every possible marker sequence, and blocks never
+    /// come to overlap.
+    ///
+    /// Degenerate marker *orders* likewise never panic: a
+    /// `PromptStart` / `CommandStart` / `CommandExecuted` with no open
+    /// block creates one at `cursor_abs_row` already in the implied state,
     /// `CommandExecuted` without `CommandStart` simply jumps the block to
     /// `Running`, and a `CommandStart`/`CommandExecuted` arriving after
     /// `CommandFinished` closes the finished block and starts a new one.
     pub fn on_marker(&mut self, marker: PromptMarker, cursor_abs_row: usize) {
-        // The fallback block is a guess made while no prompt protocol had
-        // been seen. The first marker disproves that guess, so retract it
-        // rather than leaving a phantom block for the real markers to act
-        // on. Without this, whether the phantom exists depends purely on
-        // how the host chunked its PTY reads: a read carrying the shell's
-        // startup output but no *complete* marker creates it, a read
-        // carrying both does not.
-        if !self.saw_marker {
-            if let Some(block) = self.blocks.first() {
-                if self.blocks.len() == 1 && block.implicit {
-                    self.blocks.clear(); // `next_id` is untouched: ids are never reused.
-                }
-            }
-        }
+        self.retract_fallback_guess();
         self.saw_marker = true;
         match marker {
             PromptMarker::PromptStart => {
@@ -92,9 +119,8 @@ impl BlockList {
                     {
                         return; // prompt redraw at the same row
                     }
-                    Self::close_block(open, cursor_abs_row);
                 }
-                self.push_block(cursor_abs_row, BlockLifecycle::Prompt);
+                self.start_block_at(cursor_abs_row, BlockLifecycle::Prompt);
             }
             PromptMarker::CommandStart => match self.open_block_mut() {
                 Some(open)
@@ -105,23 +131,17 @@ impl BlockList {
                 {
                     open.lifecycle = BlockLifecycle::Composing;
                 }
-                Some(open) => {
-                    // B after C/D without a fresh prompt: start a new block.
-                    Self::close_block(open, cursor_abs_row);
-                    self.push_block(cursor_abs_row, BlockLifecycle::Composing);
-                }
-                None => self.push_block(cursor_abs_row, BlockLifecycle::Composing),
+                // B after C/D without a fresh prompt (or with nothing open
+                // at all): start a new block.
+                _ => self.start_block_at(cursor_abs_row, BlockLifecycle::Composing),
             },
             PromptMarker::CommandExecuted => match self.open_block_mut() {
                 Some(open) if open.lifecycle != BlockLifecycle::Finished => {
                     open.lifecycle = BlockLifecycle::Running;
                 }
-                Some(open) => {
-                    // C after D without a fresh prompt: start a new block.
-                    Self::close_block(open, cursor_abs_row);
-                    self.push_block(cursor_abs_row, BlockLifecycle::Running);
-                }
-                None => self.push_block(cursor_abs_row, BlockLifecycle::Running),
+                // C after D without a fresh prompt (or with nothing open at
+                // all): start a new block.
+                _ => self.start_block_at(cursor_abs_row, BlockLifecycle::Running),
             },
             PromptMarker::CommandFinished { exit_code } => match self.open_block_mut() {
                 Some(open) => {
@@ -141,6 +161,50 @@ impl BlockList {
                     // of every session.
                 }
             },
+        }
+        debug_assert!(self.tail_is_sound(), "{:?}", self.blocks);
+    }
+
+    /// Retract the no-shell-integration fallback block when the first
+    /// marker disproves the guess it was based on.
+    ///
+    /// The fallback is a guess made while no prompt protocol had been seen.
+    /// The first marker proves the shell *does* speak OSC 133, so the guess
+    /// must go rather than leave a phantom block for the real markers to
+    /// act on. Without this, whether the phantom exists depends purely on
+    /// how the host chunked its PTY reads: a read carrying the shell's
+    /// startup output but no *complete* marker creates it, a read carrying
+    /// both does not.
+    ///
+    /// # The exception: a fallback block the host gave a command
+    ///
+    /// Retracting unconditionally also threw away real, unrecoverable
+    /// state: a shell that prints an MOTD or ssh banner before its first
+    /// prompt had that output orphaned (`block_at_row(0)` went `None`, so
+    /// the banner could not be selected, copied, or found by
+    /// [`BlockList::search_output`]) along with any command the host had
+    /// recorded on it. So the retraction is now conditional: a fallback
+    /// block the host recorded a command for is *kept* and simply closed at
+    /// the marker row, like any other block.
+    ///
+    /// The trade-off is deliberate and narrow. The tempting wider rule —
+    /// "keep the fallback if it holds any non-blank row" — regresses the
+    /// bug this retraction was added for: real zsh paints startup escape
+    /// output including a visible `%` before its first marker, so a
+    /// non-blank row is exactly what the phantom looks like. A
+    /// host-recorded command is the one signal that cannot come from the
+    /// shell's own preamble. The cost is that a banner *without* a recorded
+    /// command is still dropped.
+    fn retract_fallback_guess(&mut self) {
+        if self.saw_marker {
+            return;
+        }
+        let retract = match self.blocks.first() {
+            Some(block) => self.blocks.len() == 1 && block.implicit && block.command.is_none(),
+            None => false,
+        };
+        if retract {
+            self.blocks.clear(); // `next_id` is untouched: ids are never reused.
         }
     }
 
@@ -235,10 +299,11 @@ impl BlockList {
     /// never appears at all once a marker has been seen.
     pub fn observe_row(&mut self, screen: &Screen) {
         if self.blocks.is_empty() && !self.saw_marker && Self::has_output(screen) {
-            self.push_block(0, BlockLifecycle::Running);
+            self.start_block_at(0, BlockLifecycle::Running);
             if let Some(block) = self.blocks.last_mut() {
                 block.implicit = true;
             }
+            debug_assert!(self.tail_is_sound(), "{:?}", self.blocks);
         }
     }
 
@@ -280,12 +345,17 @@ impl BlockList {
 
     /// The block after the one with `id` (Warp-style jump to the next
     /// command). `None` if `id` is unknown or already the last block.
+    ///
+    /// List order is row order — the invariant keeps [`Block::start_row`]
+    /// non-decreasing — so "next" always moves *down* the screen and
+    /// "previous" always moves up, whatever the shell did to the cursor.
     pub fn next(&self, id: BlockId) -> Option<&Block> {
         self.index_of(id).and_then(|i| self.blocks.get(i + 1))
     }
 
     /// The block before the one with `id` (Warp-style jump to the previous
-    /// command). `None` if `id` is unknown or already the first block.
+    /// command). `None` if `id` is unknown or already the first block. See
+    /// [`BlockList::next`] for the ordering guarantee.
     pub fn prev(&self, id: BlockId) -> Option<&Block> {
         self.index_of(id)
             .and_then(|i| i.checked_sub(1))
@@ -306,20 +376,26 @@ impl BlockList {
     // Search and text extraction
     // -------------------------------------------------------------------
 
-    /// Blocks whose stored metadata (command / cwd) contains `query`
-    /// (case-insensitive substring), newest first.
+    /// Blocks whose stored metadata (command / cwd) contains `query`,
+    /// newest first.
+    ///
+    /// Matching is a case-insensitive substring test — see
+    /// [`BlockList::search_output`] for the exact folding rule and for the
+    /// shared empty-query semantics (an empty query matches **every**
+    /// block, including blocks with no metadata at all).
     pub fn search_metadata(&self, query: &str) -> Vec<&Block> {
-        let needle = query.to_lowercase();
+        let needle = fold_case(query);
         self.blocks
             .iter()
             .rev()
             .filter(|b| {
-                b.command
-                    .as_deref()
-                    .is_some_and(|c| c.to_lowercase().contains(&needle))
+                needle.is_empty()
+                    || b.command
+                        .as_deref()
+                        .is_some_and(|c| fold_case(c).contains(&needle))
                     || b.cwd
                         .as_deref()
-                        .is_some_and(|c| c.to_lowercase().contains(&needle))
+                        .is_some_and(|c| fold_case(c).contains(&needle))
             })
             .collect()
     }
@@ -327,16 +403,38 @@ impl BlockList {
     /// Full-text search over block *output* via the screen
     /// (case-insensitive substring), newest first. Rows evicted from
     /// scrollback are silently skipped.
+    ///
+    /// # Empty query
+    ///
+    /// `""` is a substring of every string, so an empty query matches
+    /// **every** block — here and in [`BlockList::search_metadata`], which
+    /// used to disagree by also requiring a command or cwd to be present.
+    /// Callers that want "blocks that have metadata" should filter on
+    /// [`Block::command`] / [`Block::cwd`] themselves; a search function
+    /// must not smuggle in a second predicate.
+    ///
+    /// # Case insensitivity
+    ///
+    /// Both sides are folded with [`str::to_uppercase`] followed by
+    /// [`str::to_lowercase`], which is a closer approximation of Unicode
+    /// case folding than lowercasing alone: it makes `ß`/`SS`, the `ﬁ`
+    /// ligature/`FI`, and final vs. medial sigma compare equal. It is
+    /// **not** true case folding, and two limitations are worth naming:
+    ///
+    /// - Characters whose lowercase form gains a combining mark still do
+    ///   not match their unmarked form. `İ` (U+0130) lowercases to
+    ///   `i` + U+0307, so `İstanbul` matches `İSTANBUL` but not
+    ///   `istanbul`. Fixing that needs Unicode normalization, which needs
+    ///   a dependency this crate does not take.
+    /// - The round trip is slightly *more* permissive than case folding in
+    ///   Turkic scripts: dotless `ı` uppercases to `I`, so it matches `i`.
+    ///   For a search box, over-matching is the safer error.
     pub fn search_output<'a>(&'a self, screen: &Screen, query: &str) -> Vec<&'a Block> {
-        let needle = query.to_lowercase();
+        let needle = fold_case(query);
         self.blocks
             .iter()
             .rev()
-            .filter(|b| {
-                Self::collect_text(b, screen)
-                    .to_lowercase()
-                    .contains(&needle)
-            })
+            .filter(|b| fold_case(&Self::collect_text(b, screen)).contains(&needle))
             .collect()
     }
 
@@ -351,14 +449,23 @@ impl BlockList {
     /// Drop blocks whose rows have been entirely evicted from scrollback.
     /// Returns the number of blocks pruned. Still-open blocks are never
     /// pruned.
+    ///
+    /// Note that this can only reclaim blocks whose rows have *aged out*.
+    /// It is not the answer to a block list growing without bound while
+    /// the rows are still on screen — the list keeps itself free of
+    /// row-less junk itself (see the invariant).
     pub fn prune_evicted(&mut self, screen: &Screen) -> usize {
         let evicted = screen.scrollback().evicted();
         let before = self.blocks.len();
         self.blocks.retain(|b| match b.end {
             // Keep unless every row (start..end, exclusive end) is evicted.
+            // A zero-row block sitting exactly on the eviction frontier
+            // (`start == end == evicted`) is deliberately kept: it marks a
+            // boundary that has not aged out yet.
             Some(end) => end > evicted || b.start_row >= evicted,
             None => true,
         });
+        debug_assert!(self.tail_is_sound(), "{:?}", self.blocks);
         before - self.blocks.len()
     }
 
@@ -366,10 +473,71 @@ impl BlockList {
     // Internals
     // -------------------------------------------------------------------
 
-    fn push_block(&mut self, start_row: usize, lifecycle: BlockLifecycle) {
+    /// Start a new block at absolute row `start_row` — **the only way a
+    /// block is ever created**, and therefore the single place the
+    /// type-level invariant is enforced.
+    ///
+    /// Reclaims rows `start_row..` from the blocks that currently claim
+    /// them (see [`BlockList::reclaim_rows_from`]) before pushing, so the
+    /// new block's `[start_row, ∞)` claim can never overlap an older one
+    /// and starts stay non-decreasing.
+    fn start_block_at(&mut self, start_row: usize, lifecycle: BlockLifecycle) {
+        self.reclaim_rows_from(start_row);
         let id = BlockId(self.next_id);
         self.next_id += 1;
         self.blocks.push(Block::new(id, start_row, lifecycle));
+    }
+
+    /// Void every existing claim on absolute rows `row..`.
+    ///
+    /// Those rows are about to be written over on screen, so no earlier
+    /// block can still own them:
+    ///
+    /// - a block straddling `row` is closed at `end_row = row`;
+    /// - a block lying entirely at or after `row` loses everything it ever
+    ///   owned and collapses onto `row` as a zero-row husk (which keeps
+    ///   starts non-decreasing);
+    /// - a block left owning zero rows and carrying no recorded command is
+    ///   dropped — it can never again be found by row, holds no text, and
+    ///   would otherwise be scanned forever. Retaining it *with* a command
+    ///   is what preserves a real command that happened to print nothing.
+    ///
+    /// A block that was still [`Running`](BlockLifecycle::Running) becomes
+    /// [`Finished`](BlockLifecycle::Finished) with no exit code — its
+    /// command never reported `D`.
+    ///
+    /// Costs `O(log n)` in the overwhelmingly common case where the new row
+    /// is at or past every existing end: block ends are non-decreasing
+    /// (a consequence of the invariant), so the affected blocks are a
+    /// suffix found by binary search, and only that suffix is touched.
+    fn reclaim_rows_from(&mut self, row: usize) {
+        // First block whose claim reaches past `row`. `None` (still open)
+        // sorts last, exactly as the ∞ it stands for.
+        let first = self
+            .blocks
+            .partition_point(|b| b.end.is_some_and(|end| end <= row));
+        for block in self.blocks.iter_mut().skip(first) {
+            block.start_row = block.start_row.min(row);
+            block.end = Some(row);
+            if block.lifecycle == BlockLifecycle::Running {
+                block.lifecycle = BlockLifecycle::Finished;
+            }
+        }
+        // Compact the touched suffix in place, dropping the husks. Only the
+        // suffix moves, so this stays proportional to what was reclaimed.
+        let len = self.blocks.len();
+        let mut keep = first;
+        for index in first..len {
+            let worth_keeping = match self.blocks.get(index) {
+                Some(block) => block.end != Some(block.start_row) || block.command.is_some(),
+                None => false,
+            };
+            if worth_keeping {
+                self.blocks.swap(keep, index);
+                keep += 1;
+            }
+        }
+        self.blocks.truncate(keep);
     }
 
     /// Whether `screen` has produced any output at all: some row of the
@@ -389,8 +557,35 @@ impl BlockList {
     }
 
     /// Index of the block owning `abs_row`, if any.
+    ///
+    /// `O(log n)`: starts are non-decreasing, so the owner — if there is
+    /// one — is the newest block starting at or before `abs_row`, which a
+    /// binary search finds directly. The old linear scan was worst-case on
+    /// every call, because the row being looked up is almost always in the
+    /// *newest* block while the scan started from the oldest; a host
+    /// resolving one `OSC 7` per prompt therefore paid `O(blocks²)` over a
+    /// session.
+    ///
+    /// Resolving from the newest backwards is also defence in depth: if the
+    /// list ever did hold overlapping claims, the row belongs to whatever
+    /// most recently wrote it, never to a stale block.
     fn index_at_row(&self, abs_row: usize) -> Option<usize> {
-        self.blocks.iter().position(|b| b.contains_row(abs_row))
+        let past = self.blocks.partition_point(|b| b.start_row <= abs_row);
+        for index in (0..past).rev() {
+            let block = self.blocks.get(index)?;
+            if block.contains_row(abs_row) {
+                return Some(index);
+            }
+            // `block` starts at or before `abs_row` and does not own it, so
+            // it is closed with `end <= abs_row`. Unless it owns no rows at
+            // all, every older block ends no later than its start, so none
+            // of them can own `abs_row` either — stop. Only a run of
+            // zero-row husks is worth stepping over.
+            if block.end != Some(block.start_row) {
+                return None;
+            }
+        }
+        None
     }
 
     /// The open block, if any. Invariant: only the newest block can be
@@ -399,13 +594,70 @@ impl BlockList {
         self.blocks.last_mut().filter(|b| b.end.is_none())
     }
 
-    /// Close `block` at exclusive end `end_row` (clamped so the end never
-    /// precedes the start). A block still `Running` becomes `Finished`
-    /// with no exit code — its command never reported `D`.
-    fn close_block(block: &mut Block, end_row: usize) {
-        block.end = Some(end_row.max(block.start_row));
-        if block.lifecycle == BlockLifecycle::Running {
-            block.lifecycle = BlockLifecycle::Finished;
+    /// The `O(1)` slice of the invariant that a mutation can actually
+    /// break: every mutation here only appends to, or truncates, the tail,
+    /// so checking the newest pair catches a broken enforcement path
+    /// without making debug builds quadratic. The full check is
+    /// [`BlockList::assert_invariants`].
+    fn tail_is_sound(&self) -> bool {
+        let len = self.blocks.len();
+        let (previous, last) = match (
+            len.checked_sub(2).and_then(|i| self.blocks.get(i)),
+            self.blocks.last(),
+        ) {
+            (_, None) => return true,
+            (None, Some(last)) => return last.end.map_or(true, |end| end >= last.start_row),
+            (Some(previous), Some(last)) => (previous, last),
+        };
+        previous.id < last.id
+            && previous.start_row <= last.start_row
+            && previous.end.is_some_and(|end| end <= last.start_row)
+            && last.end.map_or(true, |end| end >= last.start_row)
+    }
+
+    /// Check the type-level invariant, naming the first violation.
+    fn check_invariants(&self) -> Result<(), String> {
+        let mut previous: Option<&Block> = None;
+        for (index, block) in self.blocks.iter().enumerate() {
+            if block.end.is_none() && index + 1 != self.blocks.len() {
+                return Err(format!("block {} is open but is not the newest", block.id));
+            }
+            if let Some(end) = block.end {
+                if end < block.start_row {
+                    return Err(format!("block {} ends before it starts", block.id));
+                }
+            }
+            if let Some(prev) = previous {
+                if prev.id >= block.id {
+                    return Err(format!("ids not ascending at {} / {}", prev.id, block.id));
+                }
+                if prev.start_row > block.start_row {
+                    return Err(format!(
+                        "start rows go backwards at {} / {}",
+                        prev.id, block.id
+                    ));
+                }
+                // `prev` is closed (checked above); it must not reach into
+                // `block`.
+                if prev.end.map_or(true, |end| end > block.start_row) {
+                    return Err(format!("blocks {} and {} overlap", prev.id, block.id));
+                }
+            }
+            previous = Some(block);
+        }
+        Ok(())
+    }
+
+    /// Panic unless the type-level invariant holds. Test/debug helper —
+    /// hosts never need it, and it is asserted internally after every
+    /// mutation in debug builds.
+    #[doc(hidden)]
+    pub fn assert_invariants(&self) {
+        if let Err(why) = self.check_invariants() {
+            panic!(
+                "BlockList invariant violated: {why}; blocks: {:?}",
+                self.blocks
+            );
         }
     }
 
@@ -443,6 +695,17 @@ impl BlockList {
         // is sorted by id even after pruning.
         self.blocks.binary_search_by_key(&id, |b| b.id).ok()
     }
+}
+
+/// Fold `text` for case-insensitive comparison.
+///
+/// `str::to_lowercase` alone is *not* case folding: it leaves `ß` and `SS`
+/// different, and the same for the `ﬁ` ligature and `FI`. Uppercasing
+/// first expands those multi-character mappings, and lowercasing the
+/// result normalises what the round trip produced. The residual
+/// limitations are documented on [`BlockList::search_output`].
+fn fold_case(text: &str) -> String {
+    text.to_uppercase().to_lowercase()
 }
 
 #[cfg(test)]
@@ -1154,6 +1417,302 @@ mod tests {
     }
 
     // -- Identity -----------------------------------------------------------------
+
+    // -- The invariant: rows are a finite, reusable resource ----------------
+
+    /// Every marker kind at every row in `rows`, for the exhaustive fuzz.
+    fn all_markers(rows: &[usize]) -> Vec<(PromptMarker, usize)> {
+        let kinds = [
+            PromptMarker::PromptStart,
+            PromptMarker::CommandStart,
+            PromptMarker::CommandExecuted,
+            PromptMarker::CommandFinished { exit_code: Some(0) },
+        ];
+        rows.iter()
+            .flat_map(|row| kinds.iter().map(move |kind| (*kind, *row)))
+            .collect()
+    }
+
+    #[test]
+    fn a_marker_before_the_open_block_reclaims_its_rows() {
+        // The critical regression: a prompt marker at a row *earlier* than
+        // the open block's start. Clamping the end to the start used to
+        // leave a zero-row block behind while the new block re-claimed
+        // rows two older blocks already owned, so `block_at_row` answered
+        // with a stale block and output was orphaned.
+        let mut bl = BlockList::new();
+        run_command(&mut bl, 0, "one", 0, 2);
+        bl.on_marker(PromptMarker::PromptStart, 3);
+        bl.on_marker(PromptMarker::CommandStart, 3);
+        bl.set_command("two");
+        bl.on_marker(PromptMarker::CommandExecuted, 4);
+
+        // The cursor jumps back to row 2 (a CUP, a resize, a TUI) and the
+        // shell draws a prompt there.
+        bl.on_marker(PromptMarker::PromptStart, 2);
+        bl.assert_invariants();
+
+        let ranges: Vec<(usize, Option<usize>)> =
+            bl.blocks().map(|b| (b.start_row(), b.end_row())).collect();
+        // "one" gives up rows 2.. ; "two" owned only rows >= 3, all of
+        // which are reclaimed, but it keeps its command as a zero-row
+        // record; the new prompt owns row 2 onward.
+        assert_eq!(ranges, vec![(0, Some(2)), (2, Some(2)), (2, None)]);
+        assert_eq!(bl.blocks().nth(1).unwrap().command(), Some("two"));
+        // Row 2 resolves to the newest owner, never the stale block.
+        assert_eq!(bl.block_at_row(2).unwrap().id(), bl.last().unwrap().id());
+        assert_eq!(bl.block_at_row(1).unwrap().command(), Some("one"));
+        // Metadata written by row lands on the live block, not an older one.
+        assert!(bl.set_command_at_row(2, "three"));
+        assert_eq!(bl.first().unwrap().command(), Some("one"));
+        assert_eq!(bl.last().unwrap().command(), Some("three"));
+    }
+
+    #[test]
+    fn every_four_marker_sequence_preserves_the_invariant() {
+        // 4 marker kinds x 3 rows = 12 steps, exhaustively to depth 4:
+        // 20_736 sequences, including every degenerate order and every
+        // backwards row jump. Before the row-reclaiming invariant, 1_040
+        // of these produced overlapping blocks and 7_131 produced
+        // non-ascending starts.
+        let steps = all_markers(&[0, 1, 2]);
+        let mut checked = 0usize;
+        for a in &steps {
+            for b in &steps {
+                for c in &steps {
+                    for d in &steps {
+                        let mut bl = BlockList::new();
+                        for (marker, row) in [a, b, c, d] {
+                            bl.on_marker(*marker, *row);
+                        }
+                        bl.assert_invariants();
+                        // Row ownership is single-valued, so a row lookup
+                        // can never be ambiguous.
+                        for row in 0..4 {
+                            let owners = bl.blocks().filter(|x| x.contains_row(row)).count();
+                            assert!(owners <= 1, "row {row} owned by {owners} blocks");
+                            assert_eq!(
+                                owners == 1,
+                                bl.block_at_row(row).is_some(),
+                                "block_at_row disagrees with ownership at row {row}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 20_736);
+    }
+
+    #[test]
+    fn row_less_blocks_are_not_retained() {
+        // `C` + `D` at one row, forever: each pair closes the previous
+        // block at its own start row, so every one of them owns nothing.
+        // These used to accumulate without bound — unreachable by
+        // `block_at_row`, holding no text, and impossible to prune because
+        // their rows are on screen rather than evicted.
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::PromptStart, 0);
+        for _ in 0..10_000 {
+            bl.on_marker(PromptMarker::CommandExecuted, 0);
+            bl.on_marker(PromptMarker::CommandFinished { exit_code: Some(0) }, 0);
+        }
+        assert_eq!(bl.len(), 1, "row-less blocks accumulated");
+        bl.assert_invariants();
+        // An exit code alone does not rescue a block that owns no rows:
+        // without a command there is nothing for a UI to show.
+        assert_eq!(bl.latest().unwrap().exit_code(), Some(0));
+    }
+
+    #[test]
+    fn a_row_less_block_with_a_command_is_kept() {
+        // The complement: a real command that printed nothing and left the
+        // cursor where it was is still a command the user ran.
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::PromptStart, 4);
+        bl.on_marker(PromptMarker::CommandStart, 4);
+        bl.set_command("cd /tmp");
+        bl.on_marker(PromptMarker::CommandFinished { exit_code: Some(0) }, 4);
+        bl.on_marker(PromptMarker::PromptStart, 4);
+
+        assert_eq!(bl.len(), 2);
+        let kept = bl.first().unwrap();
+        assert_eq!(kept.command(), Some("cd /tmp"));
+        assert_eq!(kept.start_row(), 4);
+        assert_eq!(kept.end_row(), Some(4));
+        assert_eq!(kept.exit_code(), Some(0));
+        // It owns no rows, so it never shadows the live block.
+        assert_eq!(bl.block_at_row(4).unwrap().id(), bl.last().unwrap().id());
+        bl.assert_invariants();
+    }
+
+    #[test]
+    fn navigation_order_is_row_order() {
+        // "Jump to the next command" must move down the screen. When
+        // marker rows went backwards the list held starts like [0, 10, 5]
+        // and `next` walked the viewport backwards.
+        let mut bl = BlockList::new();
+        for (row, command) in [(0, "a"), (10, "b"), (20, "c")] {
+            bl.on_marker(PromptMarker::PromptStart, row);
+            bl.on_marker(PromptMarker::CommandStart, row);
+            bl.set_command(command);
+            bl.on_marker(PromptMarker::CommandExecuted, row);
+        }
+        // Now a backwards jump, the shape that used to break ordering.
+        bl.on_marker(PromptMarker::PromptStart, 5);
+        bl.on_marker(PromptMarker::CommandStart, 5);
+        bl.set_command("d");
+        bl.assert_invariants();
+
+        let starts: Vec<usize> = bl.blocks().map(Block::start_row).collect();
+        let mut sorted = starts.clone();
+        sorted.sort_unstable();
+        assert_eq!(starts, sorted, "list order must be row order");
+
+        // Walking with `next` visits rows in non-decreasing order.
+        let mut walked = vec![bl.first().unwrap().start_row()];
+        let mut cursor = bl.first().unwrap().id();
+        while let Some(block) = bl.next(cursor) {
+            walked.push(block.start_row());
+            cursor = block.id();
+        }
+        assert_eq!(walked, starts);
+        // ...and `prev` is its exact inverse.
+        let mut back = vec![bl.last().unwrap().start_row()];
+        let mut cursor = bl.last().unwrap().id();
+        while let Some(block) = bl.prev(cursor) {
+            back.push(block.start_row());
+            cursor = block.id();
+        }
+        back.reverse();
+        assert_eq!(back, starts);
+    }
+
+    #[test]
+    fn block_at_row_stays_cheap_with_many_blocks() {
+        // `index_at_row` used to scan from the oldest block while the row
+        // being looked up is essentially always in the newest, so a host
+        // resolving one OSC 7 per prompt paid O(blocks^2) over a session:
+        // 40k blocks took 1.27s of pure lookup. This is a smoke threshold,
+        // not a benchmark — a binary search does the whole loop in
+        // milliseconds, and any return to a linear scan blows past it by
+        // orders of magnitude even on a slow machine.
+        const BLOCKS: usize = 30_000;
+        let mut bl = BlockList::new();
+        for row in 0..BLOCKS {
+            bl.on_marker(PromptMarker::PromptStart, row);
+            bl.on_marker(PromptMarker::CommandStart, row);
+            bl.set_command("x"); // keep every block, even at zero rows
+        }
+        assert_eq!(bl.len(), BLOCKS);
+
+        let start = std::time::Instant::now();
+        for row in 0..BLOCKS {
+            // Worst case for the old scan: always the newest block.
+            assert!(bl.block_at_row(BLOCKS - 1 - (row % 3)).is_some());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "{BLOCKS} row lookups took {elapsed:?}; index_at_row is not O(log n)"
+        );
+    }
+
+    #[test]
+    fn index_at_row_resolves_contested_rows_to_the_newest_owner() {
+        // Defence in depth: even if two blocks somehow claimed the same
+        // row, the row belongs to whatever wrote it most recently.
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::PromptStart, 0);
+        bl.on_marker(PromptMarker::PromptStart, 5);
+        let newest = bl.latest().unwrap().id();
+        // Forge an overlap the public API can no longer produce.
+        bl.blocks[0].end = Some(9);
+        assert_eq!(bl.block_at_row(7).unwrap().id(), newest);
+        assert!(
+            bl.check_invariants().is_err(),
+            "the forgery should be detected"
+        );
+    }
+
+    // -- Fallback retraction ------------------------------------------------
+
+    #[test]
+    fn a_fallback_block_the_host_named_survives_the_first_marker() {
+        // A shell that prints an MOTD or ssh banner before its first
+        // prompt: retracting unconditionally orphaned that output, so it
+        // could not be selected, copied, or found by `search_output`.
+        let mut screen = Screen::new(24, 80);
+        let mut bl = BlockList::new();
+        feed_line(&mut screen, "Welcome to Ubuntu");
+        feed_line(&mut screen, "Last login: today");
+        bl.observe_row(&screen);
+        assert_eq!(bl.len(), 1);
+        bl.set_command("login banner");
+
+        bl.on_marker(PromptMarker::PromptStart, 2);
+        bl.assert_invariants();
+
+        assert_eq!(bl.len(), 2, "the named fallback block must survive");
+        let banner = bl.first().unwrap();
+        assert_eq!(banner.start_row(), 0);
+        assert_eq!(banner.end_row(), Some(2));
+        assert_eq!(banner.command(), Some("login banner"));
+        // The banner rows are addressable and searchable again.
+        assert_eq!(bl.block_at_row(0).unwrap().id(), banner.id());
+        assert_eq!(bl.search_output(&screen, "Welcome to Ubuntu").len(), 1);
+    }
+
+    // -- Search semantics ---------------------------------------------------
+
+    #[test]
+    fn search_folds_case_beyond_plain_lowercasing() {
+        let screen = blank_screen();
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::PromptStart, 0);
+        bl.set_command("grep straße");
+        bl.on_marker(PromptMarker::PromptStart, 1);
+        bl.set_command("open ﬁle");
+
+        // Plain `to_lowercase` leaves these different; folding does not.
+        assert_eq!(bl.search_metadata("STRASSE").len(), 1);
+        assert_eq!(bl.search_metadata("strasse").len(), 1);
+        assert_eq!(bl.search_metadata("FILE").len(), 1);
+        assert_eq!(bl.search_metadata("file").len(), 1);
+        // Ordinary case insensitivity still holds, in both entry points.
+        assert_eq!(bl.search_metadata("GREP").len(), 1);
+        assert!(bl.search_output(&screen, "nothing here").is_empty());
+
+        // Documented residual: a lowercase form that gains a combining
+        // mark still does not match the unmarked spelling. This needs
+        // Unicode normalization, which needs a dependency.
+        let mut turkish = BlockList::new();
+        turkish.on_marker(PromptMarker::PromptStart, 0);
+        turkish.set_command("echo İstanbul");
+        assert_eq!(turkish.search_metadata("İSTANBUL").len(), 1);
+        assert_eq!(turkish.search_metadata("istanbul").len(), 0);
+    }
+
+    #[test]
+    fn an_empty_query_matches_every_block_in_both_searches() {
+        // The two entry points used to disagree: `search_metadata("")`
+        // quietly filtered to blocks that had a command or cwd, while
+        // `search_output(_, "")` returned everything. "" is a substring of
+        // every string, so it matches everything; a search function must
+        // not smuggle in a second predicate.
+        let screen = blank_screen();
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::PromptStart, 0);
+        bl.set_command("named");
+        bl.on_marker(PromptMarker::PromptStart, 1); // no metadata at all
+        assert_eq!(bl.len(), 2);
+
+        assert_eq!(bl.search_metadata("").len(), 2);
+        assert_eq!(bl.search_output(&screen, "").len(), 2);
+        // Newest first, like every other search result.
+        assert_eq!(bl.search_metadata("")[0].id(), bl.last().unwrap().id());
+    }
 
     #[test]
     fn block_ids_are_stable_ordered_and_displayable() {

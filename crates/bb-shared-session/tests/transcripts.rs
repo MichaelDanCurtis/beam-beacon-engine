@@ -295,9 +295,14 @@ fn block_ranges(blocks: &BlockList) -> Vec<(usize, Option<usize>)> {
         .collect()
 }
 
-/// Assert block extents partition the row space: strictly increasing
-/// starts, and each closed block ending exactly where the next begins.
+/// Assert block extents partition the row space: non-decreasing starts,
+/// and each closed block ending exactly where the next begins.
+///
+/// Also runs the block list's own invariant check (no overlaps,
+/// non-decreasing starts, one open block, ascending ids), so every
+/// transcript in this file is a test of it.
 fn assert_contiguous_and_disjoint(blocks: &BlockList) {
+    blocks.assert_invariants();
     let ranges = block_ranges(blocks);
     for window in ranges.windows(2) {
         let (start, end) = window[0];
@@ -760,9 +765,18 @@ fn scrollback_eviction_keeps_block_ids_stable() {
     assert_eq!(session.prune_blocks(), 0);
 
     // The surviving blocks keep flowing: the session is still usable.
+    let survivors = session.blocks().len();
+    let newest_before = session.blocks().last().unwrap().id();
     session.feed_pty(prompt_line_bytes().as_slice());
-    assert_eq!(session.blocks().len(), ids_before.len() - pruned + 1);
+    // The previous prompt was drawn but never ran anything, so its block
+    // still owns zero rows; the new prompt reclaims that row and the
+    // row-less husk — no command, no cwd, no output, unreachable by
+    // `block_at_row` — is dropped rather than accumulated. The count is
+    // therefore unchanged, and the newest block is a *new* one.
+    assert_eq!(session.blocks().len(), survivors);
+    assert!(session.blocks().last().unwrap().id() > newest_before);
     assert_contiguous_and_disjoint(session.blocks());
+    session.blocks().assert_invariants();
 }
 
 /// `prompt_line()` as raw bytes (the eviction test feeds in a loop).
@@ -851,6 +865,44 @@ fn vim_style_alt_screen_roundtrip() {
         .blocks()
         .search_output(session.screen(), "ALTSCROLL")
         .is_empty());
+
+    // --- the TUI speaks OSC 133 and OSC 7 of its own ---
+    //
+    // Nothing forbids a full-screen app from emitting the prompt protocol
+    // (an embedded shell, a status line, a replayed transcript). Its
+    // cursor row is a coordinate inside its own frame; read as a row of
+    // the shell's scrollback it points somewhere in an older command's
+    // output. So markers are ignored while the alt screen is up, and a
+    // working directory belongs to the command that is *running* — the
+    // one that launched the TUI.
+    let ranges_before_tui_markers = block_ranges(session.blocks());
+    let block_count_before = session.blocks().len();
+    session.feed_pty(b"\x1b[1;1H");
+    for marker in [PROMPT_START, COMMAND_START, COMMAND_EXECUTED] {
+        session.feed_pty(marker.as_bytes());
+    }
+    session.feed_pty(command_finished(3).as_bytes());
+    session.feed_pty(report_cwd("host", "/inside/vim").as_bytes());
+    assert_eq!(
+        block_ranges(session.blocks()),
+        ranges_before_tui_markers,
+        "alt-screen markers moved block extents"
+    );
+    assert_eq!(session.blocks().len(), block_count_before);
+    assert_eq!(
+        session.blocks().get(block_id).unwrap().lifecycle(),
+        BlockLifecycle::Running,
+        "an alt-screen OSC 133;D finished a command that is still running"
+    );
+    assert_eq!(session.blocks().get(block_id).unwrap().exit_code(), None);
+    assert_eq!(
+        session.blocks().get(block_id).unwrap().cwd(),
+        Some("/inside/vim"),
+        "the TUI's cwd belongs to the command that launched it"
+    );
+    assert_eq!(session.cwd(), Some("/inside/vim"));
+    assert_contiguous_and_disjoint(session.blocks());
+    session.feed_pty(b"\x1b[6;1H");
 
     // ...and the TUI *is* still what a renderer would draw: `grid()`
     // returns the active (alternate) grid, which holds vim's frame.
