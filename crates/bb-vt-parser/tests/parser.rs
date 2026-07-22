@@ -1,19 +1,25 @@
 //! Integration tests for `bb-vt-parser`.
 //!
-//! Every input goes through [`run_dims`], which feeds the byte stream
-//! three ways — one-shot, byte-at-a-time, and in 3-byte chunks — and
-//! asserts that all three produce identical screen state and events.
-//! That makes chunk-boundary safety a property checked by *every* test,
-//! not just the dedicated split tests.
+//! Every input goes through [`run_positioned_dims`], which feeds the byte
+//! stream three ways — one-shot, byte-at-a-time, and in 3-byte chunks —
+//! and asserts that all three produce identical screen state and
+//! identical [`PositionedEvent`]s, *cursor positions included*. That
+//! makes chunk-boundary safety a property checked by *every* test, not
+//! just the dedicated split tests.
+//!
+//! Tests that only care about *what* happened use [`run`], which maps the
+//! positioned events down to bare [`VtEvent`]s; tests about *where* an
+//! event fired use [`run_positioned`].
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use bb_terminal_model::{Color, CursorShape, Screen};
-use bb_vt_parser::{Parser, VtEvent};
+use bb_vt_parser::{Parser, PositionedEvent, VtEvent};
 
 /// Feed `bytes` into a fresh `rows x cols` screen, asserting that
-/// one-shot, byte-at-a-time, and 3-byte-chunk feeding are equivalent.
-fn run_dims(bytes: &[u8], rows: usize, cols: usize) -> (Screen, Vec<VtEvent>) {
+/// one-shot, byte-at-a-time, and 3-byte-chunk feeding are equivalent —
+/// same screen, same events, same event positions.
+fn run_positioned_dims(bytes: &[u8], rows: usize, cols: usize) -> (Screen, Vec<PositionedEvent>) {
     // One-shot.
     let mut p1 = Parser::new();
     let mut s1 = Screen::new(rows, cols);
@@ -42,6 +48,23 @@ fn run_dims(bytes: &[u8], rows: usize, cols: usize) -> (Screen, Vec<VtEvent>) {
     (s1, ev1)
 }
 
+/// [`run_positioned_dims`] on a default 24x80 screen.
+fn run_positioned(bytes: &[u8]) -> (Screen, Vec<PositionedEvent>) {
+    run_positioned_dims(bytes, 24, 80)
+}
+
+/// [`run_positioned_dims`], keeping only the semantic events.
+fn run_dims(bytes: &[u8], rows: usize, cols: usize) -> (Screen, Vec<VtEvent>) {
+    let (screen, events) = run_positioned_dims(bytes, rows, cols);
+    (
+        screen,
+        events
+            .into_iter()
+            .map(PositionedEvent::into_event)
+            .collect(),
+    )
+}
+
 /// [`run_dims`] on a default 24x80 screen.
 fn run(bytes: &[u8]) -> (Screen, Vec<VtEvent>) {
     run_dims(bytes, 24, 80)
@@ -50,6 +73,21 @@ fn run(bytes: &[u8]) -> (Screen, Vec<VtEvent>) {
 /// Text of grid row `row` (trailing blanks trimmed).
 fn text(s: &Screen, row: usize) -> String {
     s.row_text(s.absolute_row(row)).unwrap_or_default()
+}
+
+/// Text of the *active* grid's row `row` (trailing blanks trimmed).
+///
+/// Absolute rows address the primary timeline even while the alternate
+/// screen is up, so assertions about what the alternate screen displays
+/// must read the active grid rather than [`text`].
+fn active_text(s: &Screen, row: usize) -> String {
+    let cells = s.grid().row(row).unwrap_or_default();
+    let rendered: String = cells
+        .iter()
+        .filter(|c| c.width != bb_terminal_model::CellWidth::WideTrail)
+        .map(|c| c.ch)
+        .collect();
+    rendered.trim_end().to_owned()
 }
 
 fn pos(s: &Screen) -> (usize, usize) {
@@ -491,7 +529,8 @@ fn unknown_modes_parsed_and_ignored() {
 fn alt_screen_1049_round_trip() {
     let (s, _) = run(b"hello\x1b[?1049h");
     assert!(s.is_alt_screen());
-    assert_eq!(text(&s, 0), ""); // alt starts cleared
+    assert_eq!(active_text(&s, 0), ""); // alt starts cleared
+    assert_eq!(text(&s, 0), "hello"); // primary timeline untouched
     let (s, _) = run(b"hello\x1b[?1049h\x1b[Hworld\x1b[?1049l");
     assert!(!s.is_alt_screen());
     assert_eq!(text(&s, 0), "hello"); // primary content intact
@@ -760,19 +799,28 @@ fn osc_unknown_codes_ignored() {
 fn osc_split_across_feed_calls() {
     let mut p = Parser::new();
     let mut s = Screen::new(24, 80);
+    // Two printed lines first, so the reported position is non-trivial.
+    assert!(p.feed(&mut s, b"out\r\nmore").is_empty());
     assert!(p.feed(&mut s, b"\x1b]133;D;").is_empty());
     assert!(p.feed(&mut s, b"1").is_empty());
     let ev = p.feed(&mut s, b"2\x07");
     assert_eq!(
         ev,
-        vec![VtEvent::CommandFinished {
-            exit_code: Some(12)
-        }]
+        vec![PositionedEvent::new(
+            VtEvent::CommandFinished {
+                exit_code: Some(12)
+            },
+            1,
+            4,
+        )]
     );
     // ST split between the ESC and the backslash.
     let mut p = Parser::new();
     assert!(p.feed(&mut s, b"\x1b]0;T\x1b").is_empty());
-    assert_eq!(p.feed(&mut s, b"\\"), vec![VtEvent::Title("T".into())]);
+    assert_eq!(
+        p.feed(&mut s, b"\\"),
+        vec![PositionedEvent::new(VtEvent::Title("T".into()), 1, 4)]
+    );
 }
 
 #[test]
@@ -800,6 +848,204 @@ fn osc_aborted_by_esc_non_st() {
     assert!(ev.is_empty());
     assert_eq!(s.pen().fg, Color::Indexed(1));
     assert_eq!(text(&s, 0), "x");
+}
+
+// ---------------------------------------------------------------------
+// Positioned events
+//
+// Events carry the cursor position captured at the byte that completed
+// the sequence. Without that, a consumer has to read the cursor after
+// `feed` returns, which yields the end-of-chunk position for *every*
+// event in the chunk — collapsing all of a 64 KiB read's command blocks
+// onto one row.
+// ---------------------------------------------------------------------
+
+/// A three-command session with OSC 133 markers, as a shell with
+/// integration enabled emits it. Each command occupies its own rows.
+const THREE_COMMANDS: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\
+     \x1b]133;C\x07a.txt\r\n\x1b]133;D;0\x07\
+     \x1b]133;A\x07$ \x1b]133;B\x07build\r\n\
+     \x1b]133;C\x07done\r\n\x1b]133;D;0\x07\
+     \x1b]133;A\x07$ \x1b]133;B\x07false\r\n\
+     \x1b]133;C\x07\x1b]133;D;1\x07";
+
+/// Where each marker in [`THREE_COMMANDS`] actually occurs.
+fn three_commands_expected() -> Vec<PositionedEvent> {
+    vec![
+        // "$ ls" on row 0, output "a.txt" on row 1.
+        PositionedEvent::new(VtEvent::PromptStart, 0, 0),
+        PositionedEvent::new(VtEvent::CommandStart, 0, 2),
+        PositionedEvent::new(VtEvent::CommandExecuted, 1, 0),
+        PositionedEvent::new(VtEvent::CommandFinished { exit_code: Some(0) }, 2, 0),
+        // "$ build" on row 2, output "done" on row 3.
+        PositionedEvent::new(VtEvent::PromptStart, 2, 0),
+        PositionedEvent::new(VtEvent::CommandStart, 2, 2),
+        PositionedEvent::new(VtEvent::CommandExecuted, 3, 0),
+        PositionedEvent::new(VtEvent::CommandFinished { exit_code: Some(0) }, 4, 0),
+        // "$ false" on row 4, no output.
+        PositionedEvent::new(VtEvent::PromptStart, 4, 0),
+        PositionedEvent::new(VtEvent::CommandStart, 4, 2),
+        PositionedEvent::new(VtEvent::CommandExecuted, 5, 0),
+        PositionedEvent::new(VtEvent::CommandFinished { exit_code: Some(1) }, 5, 0),
+    ]
+}
+
+/// Feed `bytes` into a screen from `make_screen`, in `chunk`-sized pieces
+/// (`chunk == 0` means one single call with the whole slice).
+fn feed_chunked(
+    make_screen: impl Fn() -> Screen,
+    bytes: &[u8],
+    chunk: usize,
+) -> (Screen, Vec<PositionedEvent>) {
+    let mut parser = Parser::new();
+    let mut screen = make_screen();
+    let mut events = Vec::new();
+    if chunk == 0 {
+        events.extend(parser.feed(&mut screen, bytes));
+    } else {
+        for piece in bytes.chunks(chunk) {
+            events.extend(parser.feed(&mut screen, piece));
+        }
+    }
+    (screen, events)
+}
+
+/// Assert that every chunking of `bytes` — one byte at a time up to one
+/// 64 KiB read — yields byte-identical screens and positioned events.
+fn assert_chunking_invariant(
+    make_screen: impl Fn() -> Screen + Copy,
+    bytes: &[u8],
+) -> Vec<PositionedEvent> {
+    let (screen, events) = feed_chunked(make_screen, bytes, 0);
+    for chunk in [1, 2, 3, 5, 7, 13, 64, 256, 65_536] {
+        let (other_screen, other_events) = feed_chunked(make_screen, bytes, chunk);
+        assert_eq!(screen, other_screen, "screen differs at chunk size {chunk}");
+        assert_eq!(
+            events, other_events,
+            "positioned events differ at chunk size {chunk}"
+        );
+    }
+    events
+}
+
+#[test]
+fn osc133_markers_carry_their_own_row_in_one_shot_feed() {
+    // The whole transcript in ONE call — the common case, since a real
+    // terminal reads the PTY in chunks of up to 64 KiB.
+    let mut parser = Parser::new();
+    let mut screen = Screen::new(24, 80);
+    let events = parser.feed(&mut screen, THREE_COMMANDS);
+    assert_eq!(events, three_commands_expected());
+
+    // Every prompt marker lands on a distinct, increasing row, even
+    // though the cursor ends up on row 5 for all of them if you read it
+    // after the call.
+    let prompt_rows: Vec<usize> = events
+        .iter()
+        .filter(|e| e.event == VtEvent::PromptStart)
+        .map(|e| e.cursor_row)
+        .collect();
+    assert_eq!(prompt_rows, vec![0, 2, 4]);
+    assert!(prompt_rows.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(screen.cursor_absolute_row(), 5);
+
+    // The rows are real: they hold the command lines they mark.
+    assert_eq!(screen.row_text(0).as_deref(), Some("$ ls"));
+    assert_eq!(screen.row_text(1).as_deref(), Some("a.txt"));
+    assert_eq!(screen.row_text(2).as_deref(), Some("$ build"));
+    assert_eq!(screen.row_text(3).as_deref(), Some("done"));
+    assert_eq!(screen.row_text(4).as_deref(), Some("$ false"));
+}
+
+#[test]
+fn osc133_positions_identical_across_every_chunking() {
+    // The regression test for the chunk-dependent-block-boundaries bug:
+    // one byte at a time, 3 bytes at a time, and one 64 KiB call must all
+    // produce the exact same Vec<PositionedEvent>.
+    let events = assert_chunking_invariant(|| Screen::new(24, 80), THREE_COMMANDS);
+    assert_eq!(events, three_commands_expected());
+}
+
+#[test]
+fn marker_row_accounts_for_scrollback_eviction() {
+    // A 3-row grid retaining only 2 scrollback lines: printing 6 lines
+    // pushes 3 out of the grid and evicts the oldest from scrollback.
+    // Absolute rows keep counting past the evicted row, so a marker
+    // recorded before the eviction still names the row it fired on.
+    let make = || Screen::with_scrollback(3, 20, 2);
+    let bytes = b"\x1b]133;A\x07l0\r\nl1\r\nl2\r\nl3\r\nl4\r\n\x1b]133;A\x07";
+    let events = assert_chunking_invariant(make, bytes);
+    let (screen, _) = feed_chunked(make, bytes, 0);
+
+    assert_eq!(screen.scrollback().evicted(), 1, "expected one eviction");
+    assert_eq!(
+        events,
+        vec![
+            PositionedEvent::new(VtEvent::PromptStart, 0, 0),
+            PositionedEvent::new(VtEvent::PromptStart, 5, 0),
+        ]
+    );
+    // Row 0 has been evicted, but its id was never reused, so the first
+    // marker is still unambiguous.
+    assert!(events[0].cursor_row < screen.scrollback().evicted());
+    assert_eq!(screen.row_text(events[0].cursor_row), None);
+    // The second marker is at the live cursor; the first is not. Reading
+    // the cursor after the feed would have reported 5 for both.
+    assert_eq!(events[1].cursor_row, screen.cursor_absolute_row());
+    assert_ne!(events[0].cursor_row, screen.cursor_absolute_row());
+}
+
+#[test]
+fn title_cwd_hyperlink_and_bell_carry_positions() {
+    let (_, ev) = run_positioned(
+        b"boot\x1b]0;term\x07\r\n\x1b]7;file:///tmp\x07see \
+          \x1b]8;;https://x.dev\x07link\x1b]8;;\x07!\x07",
+    );
+    assert_eq!(
+        ev,
+        vec![
+            // After "boot" on row 0.
+            PositionedEvent::new(VtEvent::Title("term".into()), 0, 4),
+            // Start of row 1.
+            PositionedEvent::new(VtEvent::WorkingDirectory("file:///tmp".into()), 1, 0),
+            // After "see ".
+            PositionedEvent::new(VtEvent::Hyperlink(Some("https://x.dev".into())), 1, 4),
+            // After "link".
+            PositionedEvent::new(VtEvent::Hyperlink(None), 1, 8),
+            // After "!".
+            PositionedEvent::new(VtEvent::Bell, 1, 9),
+        ]
+    );
+}
+
+#[test]
+fn positions_follow_cursor_addressing_and_scrolling() {
+    // Absolute addressing: the marker reports where CUP put the cursor.
+    let (_, ev) = run_positioned(b"\x1b[5;10H\x1b]133;A\x07");
+    assert_eq!(ev, vec![PositionedEvent::new(VtEvent::PromptStart, 4, 9)]);
+
+    // A marker after the grid has scrolled reports the absolute row, not
+    // the grid row, so it stays valid as the row moves into scrollback.
+    let (screen, ev) = run_positioned_dims(b"a\r\nb\r\nc\r\nd\x1b]133;C\x07", 3, 10);
+    assert_eq!(
+        ev,
+        vec![PositionedEvent::new(VtEvent::CommandExecuted, 3, 1)]
+    );
+    assert_eq!(screen.cursor().row, 2); // grid row differs from row 3
+    assert_eq!(screen.row_text(3).as_deref(), Some("d"));
+}
+
+#[test]
+fn positioned_event_conversions() {
+    let event = PositionedEvent::new(VtEvent::Bell, 7, 3);
+    assert_eq!(event.cursor(), (7, 3));
+    assert_eq!(event.clone().into_event(), VtEvent::Bell);
+    assert_eq!(VtEvent::from(event), VtEvent::Bell);
+
+    // The ergonomic "I only care what happened" path.
+    let (_, ev) = run_positioned(b"\x1b]133;A\x07x\x07");
+    let plain: Vec<VtEvent> = ev.into_iter().map(PositionedEvent::into_event).collect();
+    assert_eq!(plain, vec![VtEvent::PromptStart, VtEvent::Bell]);
 }
 
 // ---------------------------------------------------------------------

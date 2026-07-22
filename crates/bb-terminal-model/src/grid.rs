@@ -159,16 +159,59 @@ impl Grid {
         }
     }
 
-    /// Resize the grid. New cells are blank; truncated cells are discarded.
+    /// Resize the grid, **discarding all contents**. Every cell in the new
+    /// grid is blank.
     ///
-    /// This is a destructive operation — callers that need to preserve
-    /// content across a resize should snapshot first, then re-render. A
-    /// reflow-preserving resize is a future addition.
+    /// This is the low-level destructive primitive, kept for callers that
+    /// genuinely want a fresh buffer of a new size. Callers that want a
+    /// window resize to behave like a real terminal — on-screen text
+    /// survives — want [`Grid::resize_preserving`] instead;
+    /// [`crate::Screen::resize`] uses that one.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
         self.cols = cols;
         self.cells.clear();
         self.cells.resize(rows * cols, Cell::default());
+    }
+
+    /// Resize the grid, **preserving the overlapping region**.
+    ///
+    /// The grid is anchored at its top-left corner: a cell at `(row, col)`
+    /// that exists in both the old and the new dimensions keeps its
+    /// character, attributes, and [`crate::CellWidth`] tag. Rows past the
+    /// new height and columns past the new width are dropped, and cells
+    /// exposed by growth are set to `blank`.
+    ///
+    /// There is **no reflow**: lines are neither rewrapped when the grid
+    /// narrows nor unwrapped when it widens. Narrowing can therefore split
+    /// a wide-character pair across the new right edge; callers that model
+    /// wide characters should blank an orphaned [`crate::CellWidth::WideLead`]
+    /// in the last column afterwards (this is what [`crate::Screen::resize`]
+    /// does).
+    ///
+    /// Because the anchor is the *top* row, shrinking the height keeps the
+    /// top of the grid. Callers that want to keep the *bottom* (where a
+    /// terminal's cursor and most recent output live) should first scroll
+    /// the rows they want to shed off the top with
+    /// [`Grid::scroll_up_within`] — that also gives them a chance to copy
+    /// those rows into scrollback.
+    pub fn resize_preserving(&mut self, rows: usize, cols: usize, blank: Cell) {
+        if self.rows == rows && self.cols == cols {
+            return;
+        }
+        let mut cells = vec![blank; rows * cols];
+        let copy_rows = self.rows.min(rows);
+        let copy_cols = self.cols.min(cols);
+        for r in 0..copy_rows {
+            let src = self.cells.get(r * self.cols..r * self.cols + copy_cols);
+            let dst = cells.get_mut(r * cols..r * cols + copy_cols);
+            if let (Some(src), Some(dst)) = (src, dst) {
+                dst.copy_from_slice(src);
+            }
+        }
+        self.rows = rows;
+        self.cols = cols;
+        self.cells = cells;
     }
 }
 
@@ -290,6 +333,41 @@ mod tests {
         g.resize(3, 3);
         assert_eq!(g.dimensions(), (3, 3));
         assert_eq!(g.cell(0, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn grid_resize_preserving_keeps_the_overlapping_region() {
+        let mut g = grid_with_letters(3, 3);
+        g.cell_mut(1, 1).unwrap().attrs.bold = true;
+        g.resize_preserving(2, 2, Cell::default());
+        assert_eq!(g.dimensions(), (2, 2));
+        assert_eq!(g.cell(0, 0).unwrap().ch, 'A');
+        assert_eq!(g.cell(0, 1).unwrap().ch, 'A');
+        assert_eq!(g.cell(1, 0).unwrap().ch, 'B');
+        assert!(g.cell(1, 1).unwrap().attrs.bold); // attributes survive
+        assert!(g.cell(2, 0).is_none()); // row 'C' dropped
+    }
+
+    #[test]
+    fn grid_resize_preserving_pads_growth_with_the_blank_cell() {
+        let mut g = grid_with_letters(1, 2);
+        let blank = Cell::blank(CellAttrs {
+            bg: Color::Indexed(5),
+            ..CellAttrs::default()
+        });
+        g.resize_preserving(2, 3, blank);
+        assert_eq!(g.dimensions(), (2, 3));
+        assert_eq!(g.cell(0, 1).unwrap().ch, 'A'); // old content kept
+        assert_eq!(*g.cell(0, 2).unwrap(), blank); // new column
+        assert_eq!(*g.cell(1, 0).unwrap(), blank); // new row
+    }
+
+    #[test]
+    fn grid_resize_preserving_is_a_noop_at_the_same_dimensions() {
+        let mut g = grid_with_letters(2, 2);
+        let before = g.clone();
+        g.resize_preserving(2, 2, Cell::default());
+        assert_eq!(g, before);
     }
 
     #[test]

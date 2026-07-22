@@ -14,10 +14,16 @@ use crate::block::{Block, BlockId, BlockLifecycle, PromptMarker};
 /// # Heuristic fallback (no shell integration)
 ///
 /// If [`BlockList::on_marker`] is never called — the shell emits no OSC 133
-/// markers — the first call to [`BlockList::observe_row`] lazily creates a
-/// single implicit [`BlockLifecycle::Running`] block starting at absolute
-/// row `0`, so all output is still navigable as one block. The implicit
-/// block is only created while no marker has ever been seen.
+/// markers — [`BlockList::observe_row`] lazily creates a single implicit
+/// [`BlockLifecycle::Running`] block starting at absolute row `0`, so all
+/// output is still navigable as one block.
+///
+/// That block materializes on the first `observe_row` whose screen actually
+/// holds output, **not** merely because a feed happened: a host's first PTY
+/// reads routinely carry nothing but a partial escape sequence, and a block
+/// created for those would be an empty phantom that the shell's real first
+/// prompt immediately closes. See [`BlockList::observe_row`] for the exact
+/// rule.
 #[derive(Debug, Clone, Default)]
 pub struct BlockList {
     blocks: Vec<Block>,
@@ -125,33 +131,97 @@ impl BlockList {
     /// Record the command text for the composing/just-started block (the
     /// host captures it from the input line or shell integration).
     ///
-    /// Applies to the newest block; no-op if the list is empty.
+    /// Applies to the newest block; no-op if the list is empty. This is the
+    /// right call for a *live* host, which records the command the moment
+    /// the user submits it — the newest block is then necessarily the one
+    /// being composed. A host replaying or reattaching to a transcript can
+    /// see several commands' markers in a single feed; it should use
+    /// [`BlockList::set_command_at_row`] instead, which is independent of
+    /// how the byte stream was chunked.
     pub fn set_command(&mut self, command: &str) {
         if let Some(block) = self.blocks.last_mut() {
             block.command = Some(command.to_owned());
         }
     }
 
+    /// Record the command text for the block that owns absolute row
+    /// `abs_row` (the row an `OSC 133;B` marker was observed at).
+    ///
+    /// Returns whether a block owned that row; `false` (a no-op) when no
+    /// block covers it. Row ownership is inclusive of [`Block::start_row`]
+    /// and exclusive of [`Block::end_row`], exactly like
+    /// [`BlockList::block_at_row`].
+    pub fn set_command_at_row(&mut self, abs_row: usize, command: &str) -> bool {
+        match self.index_at_row(abs_row) {
+            Some(index) => {
+                if let Some(block) = self.blocks.get_mut(index) {
+                    block.command = Some(command.to_owned());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Record the working directory for the current block (the host
     /// translates OSC 7).
     ///
-    /// Applies to the newest block; no-op if the list is empty.
+    /// Applies to the newest block; no-op if the list is empty. See
+    /// [`BlockList::set_cwd_at_row`] for the chunking-independent variant.
     pub fn set_cwd(&mut self, cwd: &str) {
         if let Some(block) = self.blocks.last_mut() {
             block.cwd = Some(cwd.to_owned());
         }
     }
 
-    /// Inform the list that output has advanced to this absolute row (e.g.
-    /// after each parser feed), so the open block's provisional extent
-    /// tracks output growth.
+    /// Record the working directory for the block that owns absolute row
+    /// `abs_row` (the row an `OSC 7` report was observed at).
     ///
-    /// If no marker has ever been seen and the list is empty, this lazily
-    /// creates the implicit fallback block (see the type-level docs).
-    pub fn observe_row(&mut self, cursor_abs_row: usize) {
-        if self.blocks.is_empty() && !self.saw_marker {
+    /// Returns whether a block owned that row; `false` (a no-op) when no
+    /// block covers it.
+    pub fn set_cwd_at_row(&mut self, abs_row: usize, cwd: &str) -> bool {
+        match self.index_at_row(abs_row) {
+            Some(index) => {
+                if let Some(block) = self.blocks.get_mut(index) {
+                    block.cwd = Some(cwd.to_owned());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Inform the list that the terminal has advanced, so the open block's
+    /// provisional extent tracks output growth. Hosts call this once after
+    /// every parser feed, handing over the live screen.
+    ///
+    /// # When the implicit fallback block is created
+    ///
+    /// This call creates the "no shell integration" fallback block (see the
+    /// type-level docs) when, and only when, **all three** hold:
+    ///
+    /// 1. no [`PromptMarker`] has ever been seen — the shell is not
+    ///    speaking the OSC 133 prompt protocol;
+    /// 2. the list is still empty; and
+    /// 3. `screen` has produced output — some row of the primary grid is
+    ///    non-blank, or rows have already moved into (or out of)
+    ///    scrollback.
+    ///
+    /// Condition 3 is what stops a shell that *does* have integration from
+    /// growing a phantom leading block. A host's first PTY read very often
+    /// carries nothing but a partial escape sequence — a lone `ESC`, a
+    /// bracketed-paste enable (`ESC [ ? 2 0 0 4 h`), or the first bytes of
+    /// `ESC ] 1 3 3 ; A` — which prints nothing and completes no marker.
+    /// Creating a block for it would manufacture an empty, zero-height
+    /// block that the shell's real first prompt then immediately closes.
+    /// Nothing about the *rule* depends on how the stream was chunked: the
+    /// fallback appears on the first feed that puts text on the screen, and
+    /// never appears at all once a marker has been seen.
+    pub fn observe_row(&mut self, screen: &Screen) {
+        if self.blocks.is_empty() && !self.saw_marker && Self::has_output(screen) {
             self.push_block(0, BlockLifecycle::Running);
         }
+        let cursor_abs_row = screen.cursor_absolute_row();
         if let Some(open) = self.open_block_mut() {
             open.last_row = open.last_row.max(cursor_abs_row);
         }
@@ -190,7 +260,7 @@ impl BlockList {
     /// [`Block::start_row`], exclusive of [`Block::end_row`]. A still-open
     /// block owns every row from its start onward.
     pub fn block_at_row(&self, abs_row: usize) -> Option<&Block> {
-        self.blocks.iter().find(|b| b.contains_row(abs_row))
+        self.index_at_row(abs_row).and_then(|i| self.blocks.get(i))
     }
 
     /// The block after the one with `id` (Warp-style jump to the next
@@ -287,6 +357,27 @@ impl BlockList {
         self.blocks.push(Block::new(id, start_row, lifecycle));
     }
 
+    /// Whether `screen` has produced any output at all: some row of the
+    /// primary grid is non-blank, or rows have already moved into (or out
+    /// of) scrollback. Bounded by the grid's size — scrollback is answered
+    /// by its length alone, never scanned.
+    fn has_output(screen: &Screen) -> bool {
+        let scrollback = screen.scrollback();
+        if !scrollback.is_empty() || scrollback.evicted() > 0 {
+            return true;
+        }
+        (0..screen.rows()).any(|row| {
+            screen
+                .row_text(screen.absolute_row(row))
+                .is_some_and(|text| !text.is_empty())
+        })
+    }
+
+    /// Index of the block owning `abs_row`, if any.
+    fn index_at_row(&self, abs_row: usize) -> Option<usize> {
+        self.blocks.iter().position(|b| b.contains_row(abs_row))
+    }
+
     /// The open block, if any. Invariant: only the newest block can be
     /// open (every earlier block was closed when its successor started).
     fn open_block_mut(&mut self) -> Option<&mut Block> {
@@ -375,6 +466,23 @@ mod tests {
         screen.linefeed();
     }
 
+    /// A screen whose cursor sits on absolute row `row`, with content on
+    /// every row above it — the shape a real terminal has once output has
+    /// scrolled that far.
+    fn screen_at_row(row: usize) -> Screen {
+        let mut screen = Screen::new(row + 1, 20);
+        for r in 0..row {
+            feed_line(&mut screen, &format!("row{r}"));
+        }
+        assert_eq!(screen.cursor_absolute_row(), row);
+        screen
+    }
+
+    /// A screen that has never been written to.
+    fn blank_screen() -> Screen {
+        Screen::new(4, 20)
+    }
+
     // -- Lifecycle ---------------------------------------------------------
 
     #[test]
@@ -394,7 +502,7 @@ mod tests {
         bl.on_marker(PromptMarker::CommandExecuted, 1);
         assert_eq!(bl.latest().unwrap().lifecycle(), BlockLifecycle::Running);
 
-        bl.observe_row(4);
+        bl.observe_row(&screen_at_row(4));
         bl.on_marker(PromptMarker::CommandFinished { exit_code: Some(0) }, 5);
         let block = bl.latest().unwrap();
         assert_eq!(block.lifecycle(), BlockLifecycle::Finished);
@@ -571,8 +679,8 @@ mod tests {
     fn observe_row_without_markers_creates_single_implicit_block() {
         let mut bl = BlockList::new();
         assert!(bl.is_empty());
-        bl.observe_row(3);
-        bl.observe_row(9);
+        bl.observe_row(&screen_at_row(3));
+        bl.observe_row(&screen_at_row(9));
         assert_eq!(bl.len(), 1);
         let block = bl.latest().unwrap();
         assert_eq!(block.start_row(), 0);
@@ -583,12 +691,104 @@ mod tests {
     }
 
     #[test]
+    fn observe_row_on_a_blank_screen_creates_nothing() {
+        // The host fed bytes that printed nothing (a partial escape
+        // sequence). No block may be manufactured for that.
+        let mut bl = BlockList::new();
+        bl.observe_row(&blank_screen());
+        bl.observe_row(&blank_screen());
+        assert!(bl.is_empty(), "a blank screen must not create a block");
+
+        // The very first printed character does create it.
+        let mut screen = blank_screen();
+        screen.print('$');
+        bl.observe_row(&screen);
+        assert_eq!(bl.len(), 1);
+        assert_eq!(bl.latest().unwrap().start_row(), 0);
+    }
+
+    #[test]
+    fn observe_row_treats_scrolled_content_as_output() {
+        // Content that has already scrolled off the grid still counts,
+        // even though every visible row is now blank.
+        let mut screen = Screen::with_scrollback(2, 20, 8);
+        feed_line(&mut screen, "hello");
+        feed_line(&mut screen, "");
+        feed_line(&mut screen, "");
+        assert!(!screen.scrollback().is_empty());
+
+        let mut bl = BlockList::new();
+        bl.observe_row(&screen);
+        assert_eq!(bl.len(), 1);
+    }
+
+    #[test]
     fn observe_row_after_markers_does_not_create_extra_blocks() {
         let mut bl = BlockList::new();
         bl.on_marker(PromptMarker::PromptStart, 2);
-        bl.observe_row(5);
+        bl.observe_row(&screen_at_row(5));
         assert_eq!(bl.len(), 1);
         assert_eq!(bl.latest().unwrap().start_row(), 2);
+    }
+
+    #[test]
+    fn observe_row_never_creates_the_fallback_once_a_marker_was_seen() {
+        // A marker arrived and then its block was pruned away: the list is
+        // empty again, but the shell is known to speak OSC 133, so the
+        // fallback must stay retired.
+        let mut screen = Screen::with_scrollback(2, 20, 1);
+        let mut bl = BlockList::new();
+        bl.on_marker(PromptMarker::PromptStart, 0);
+        bl.on_marker(PromptMarker::PromptStart, 1);
+        bl.on_marker(PromptMarker::CommandFinished { exit_code: Some(0) }, 1);
+        while screen.scrollback().evicted() < 4 {
+            feed_line(&mut screen, "x");
+        }
+        bl.blocks.clear(); // simulate every block being pruned away
+        bl.observe_row(&screen);
+        assert!(bl.is_empty());
+    }
+
+    // -- Row-addressed metadata ---------------------------------------------
+
+    #[test]
+    fn set_command_and_cwd_at_row_target_the_owning_block() {
+        let mut bl = BlockList::new();
+        run_command(&mut bl, 0, "", 0, 1);
+        bl.on_marker(PromptMarker::PromptStart, 4); // closes block 0 at [0,4)
+        run_command(&mut bl, 4, "", 0, 5);
+        bl.on_marker(PromptMarker::PromptStart, 9); // closes block 1 at [4,9)
+
+        assert!(bl.set_command_at_row(0, "first"));
+        assert!(bl.set_cwd_at_row(3, "/a"));
+        assert!(bl.set_command_at_row(4, "second"));
+        assert!(bl.set_cwd_at_row(8, "/b"));
+        assert!(bl.set_command_at_row(9, "third")); // the open block
+                                                    // An open block owns every row from its start onward.
+        assert!(bl.set_command_at_row(usize::MAX, "third"));
+
+        let blocks: Vec<&Block> = bl.blocks().collect();
+        assert_eq!(blocks[0].command(), Some("first"));
+        assert_eq!(blocks[0].cwd(), Some("/a"));
+        assert_eq!(blocks[1].command(), Some("second"));
+        assert_eq!(blocks[1].cwd(), Some("/b"));
+        assert_eq!(blocks[2].command(), Some("third"));
+        assert_eq!(blocks[2].cwd(), None);
+    }
+
+    #[test]
+    fn set_command_and_cwd_at_unowned_row_are_noops() {
+        let mut bl = BlockList::new();
+        assert!(!bl.set_command_at_row(0, "ls"));
+        assert!(!bl.set_cwd_at_row(0, "/tmp"));
+        assert!(bl.is_empty());
+
+        bl.on_marker(PromptMarker::PromptStart, 5);
+        // Rows before the first block belong to nobody.
+        assert!(!bl.set_command_at_row(4, "ls"));
+        assert!(!bl.set_cwd_at_row(0, "/tmp"));
+        assert_eq!(bl.latest().unwrap().command(), None);
+        assert_eq!(bl.latest().unwrap().cwd(), None);
     }
 
     // -- block_at_row boundaries --------------------------------------------
@@ -700,7 +900,7 @@ mod tests {
         feed_line(&mut screen, "$ echo Hello");
         bl.on_marker(PromptMarker::CommandExecuted, screen.cursor_absolute_row());
         feed_line(&mut screen, "Hello world");
-        bl.observe_row(screen.cursor_absolute_row());
+        bl.observe_row(&screen);
         bl.on_marker(
             PromptMarker::CommandFinished { exit_code: Some(0) },
             screen.cursor_absolute_row(),
@@ -712,7 +912,7 @@ mod tests {
         feed_line(&mut screen, "$ rg needle");
         bl.on_marker(PromptMarker::CommandExecuted, screen.cursor_absolute_row());
         feed_line(&mut screen, "src/lib.rs: needle found");
-        bl.observe_row(screen.cursor_absolute_row());
+        bl.observe_row(&screen);
         bl.on_marker(
             PromptMarker::CommandFinished { exit_code: Some(1) },
             screen.cursor_absolute_row(),
@@ -770,7 +970,7 @@ mod tests {
         feed_line(&mut screen, "line1");
         feed_line(&mut screen, "line2");
         feed_line(&mut screen, "line3");
-        bl.observe_row(screen.cursor_absolute_row());
+        bl.observe_row(&screen);
         assert!(screen.scrollback().evicted() > 0);
 
         let id = bl.latest().unwrap().id();

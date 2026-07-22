@@ -47,13 +47,28 @@ struct SavedCursor {
 /// the row arguments of [`Screen::cursor_goto`] and [`Screen::cursor_to_row`]
 /// are relative to the top of the scroll region and clamped inside it.
 ///
+/// # Two grids, two coordinate systems
+///
+/// A `Screen` holds two grids and they answer two different questions:
+///
+/// - [`Screen::grid`] is **what to draw**: the *active* grid, which is the
+///   alternate grid while a full-screen application (vim, htop, less) owns
+///   the screen and the primary grid otherwise.
+/// - Absolute rows are **the scrollback timeline**: they always address the
+///   *primary* screen's history (scrollback plus [`Screen::primary_grid`]).
+///   The alternate screen has no scrollback and never advances that
+///   timeline, so an alt-screen episode leaves absolute rows completely
+///   untouched — [`Screen::line`], [`Screen::row_text`], and
+///   [`Screen::viewport_rows`] keep returning the shell output underneath
+///   the running application, not the application's frame buffer.
+///
 /// # Absolute rows
 ///
 /// Every row ever produced has a stable *absolute row id*:
-/// `absolute = scrollback.evicted() + scrollback_index`, and grid row `r` is
-/// `absolute_row(r) = evicted + scrollback.len() + r`. Ids of evicted rows
-/// are never reused, so downstream consumers (e.g. a block list) can hold
-/// them forever.
+/// `absolute = scrollback.evicted() + scrollback_index`, and primary grid
+/// row `r` is `absolute_row(r) = evicted + scrollback.len() + r`. Ids of
+/// evicted rows are never reused, so downstream consumers (e.g. a block
+/// list) can hold them forever.
 ///
 /// # Erase/scroll fill
 ///
@@ -129,14 +144,38 @@ impl Screen {
         self.primary.cols()
     }
 
-    /// Borrow the currently active grid (alternate if the alt screen is
-    /// active, primary otherwise).
+    /// Borrow the currently **active** grid: the alternate grid while the
+    /// alternate screen is up, the primary grid otherwise.
+    ///
+    /// This is *what to draw* — renderers should always paint this grid,
+    /// because it is what the user is looking at.
+    ///
+    /// It is deliberately **not** what absolute row ids address. Absolute
+    /// rows are *the scrollback timeline* and always resolve against the
+    /// primary screen (see [`Screen::line`], [`Screen::row_text`],
+    /// [`Screen::viewport_rows`], and [`Screen::primary_grid`]). While a
+    /// full-screen application owns the alternate screen, `grid()` returns
+    /// the application's frame buffer and `row_text(absolute)` returns the
+    /// shell output underneath it; both are correct answers to different
+    /// questions.
     pub fn grid(&self) -> &Grid {
         if self.alt_active {
             &self.alt
         } else {
             &self.primary
         }
+    }
+
+    /// Borrow the **primary** grid, whether or not the alternate screen is
+    /// currently active.
+    ///
+    /// This is the grid that absolute row ids address: primary grid row `r`
+    /// is absolute row `evicted + scrollback.len() + r`. Use
+    /// [`Screen::grid`] to draw the screen and this to reason about the
+    /// session's output timeline (blocks, search, transcripts), which an
+    /// alt-screen episode must not disturb.
+    pub fn primary_grid(&self) -> &Grid {
+        &self.primary
     }
 
     /// Borrow the cursor.
@@ -738,22 +777,83 @@ impl Screen {
     // Resize and reset
     // -------------------------------------------------------------------
 
-    /// Resize both grids to `rows × cols` (clamped to at least `1 × 1`).
+    /// Resize both grids to `rows × cols` (clamped to at least `1 × 1`),
+    /// **preserving on-screen content**.
     ///
-    /// The resize is destructive: grid contents are cleared (scrollback is
-    /// kept intact). The cursor is clamped into the new bounds, the scroll
-    /// region resets to the full screen, and tab stops reset to every 8
-    /// columns.
+    /// # Policy
+    ///
+    /// - **Overlap is kept.** A cell at `(row, col)` that exists in both the
+    ///   old and the new dimensions keeps its character *and* its
+    ///   attributes. Cells exposed by growth are blank with default attrs.
+    /// - **No reflow.** Lines are neither rewrapped when the screen narrows
+    ///   nor unwrapped when it widens; columns past the new width are
+    ///   dropped. (Reflow is a much larger change and is out of scope.) A
+    ///   wide-character pair split by the new right edge has its orphaned
+    ///   lead blanked so no half character survives.
+    /// - **Shrinking height keeps the bottom.** The cursor and the most
+    ///   recent output live near the bottom, so the rows that go are taken
+    ///   off the *top*: exactly as many as are needed to keep the cursor
+    ///   row on screen (`cursor_row + 1 - rows`, never more than the height
+    ///   lost). Those rows leave the primary grid the same way they would
+    ///   if the shell had scrolled them off — **pushed into scrollback** —
+    ///   so they are still addressable at *the same absolute row ids*. The
+    ///   alternate screen has no scrollback, so its shed rows are simply
+    ///   discarded. Any remaining height reduction comes off the bottom,
+    ///   which is where a terminal's blank/stale rows are.
+    /// - **Absolute rows stay coherent.** Every preserved row keeps its
+    ///   absolute id (rows shed off the top move into scrollback, which
+    ///   grows by exactly the same amount), and so does
+    ///   [`Screen::cursor_absolute_row`]. Scrollback itself is untouched —
+    ///   its rows keep the width they had when they were pushed.
+    /// - The cursor and both saved cursors follow their content and are
+    ///   clamped into the new bounds, the scroll region resets to the full
+    ///   screen, tab stops are rebuilt every 8 columns, and the
+    ///   pending-wrap flag is cleared (all standard on resize).
+    ///
+    /// Both grids are resized, each preserving its own contents. The single
+    /// shared cursor row decides the shed count for both.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let rows = rows.max(1);
         let cols = cols.max(1);
-        self.primary.resize(rows, cols);
-        self.alt.resize(rows, cols);
+        let old_rows = self.rows();
+
+        // Rows that must leave the top so the cursor stays on screen. When
+        // the cursor already fits, this is 0 and the height loss is taken
+        // off the bottom instead.
+        let lost = old_rows.saturating_sub(rows);
+        let shed = (self.cursor.row + 1).saturating_sub(rows).min(lost);
+        if shed > 0 {
+            // Primary rows leaving the top keep their absolute ids by
+            // moving into scrollback; the alternate screen has none.
+            for r in 0..shed {
+                if let Some(cells) = self.primary.row(r) {
+                    let owned = cells.to_vec();
+                    self.scrollback.push_row(owned);
+                }
+            }
+            let blank = Cell::default();
+            self.primary.scroll_up_within(0, old_rows - 1, shed, blank);
+            self.alt.scroll_up_within(0, old_rows - 1, shed, blank);
+        }
+
+        let blank = Cell::default();
+        self.primary.resize_preserving(rows, cols, blank);
+        self.alt.resize_preserving(rows, cols, blank);
+        Self::heal_wide_edge(&mut self.primary, blank);
+        Self::heal_wide_edge(&mut self.alt, blank);
+
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
         self.tabs = Self::default_tabs(cols);
-        self.cursor.row = self.cursor.row.min(rows - 1);
+        self.cursor.row = self.cursor.row.saturating_sub(shed).min(rows - 1);
         self.cursor.col = self.cursor.col.min(cols - 1);
+        for saved in [&mut self.saved_primary, &mut self.saved_alt]
+            .into_iter()
+            .flatten()
+        {
+            saved.cursor.row = saved.cursor.row.saturating_sub(shed).min(rows - 1);
+            saved.cursor.col = saved.cursor.col.min(cols - 1);
+        }
         self.pending_wrap = false;
     }
 
@@ -782,29 +882,46 @@ impl Screen {
 
     // -------------------------------------------------------------------
     // Absolute-row addressing
+    //
+    // Absolute rows are a coordinate on the PRIMARY screen's scrollback
+    // timeline. Every method in this section resolves against scrollback
+    // plus the primary grid, never the alternate grid — see the type-level
+    // "Two grids, two coordinate systems" docs.
     // -------------------------------------------------------------------
 
-    /// Number of currently addressable rows: scrollback retained rows plus
-    /// grid rows. (Valid absolute ids span
-    /// `scrollback().evicted() .. scrollback().evicted() + total_rows()`.)
+    /// Number of currently addressable rows on the primary timeline:
+    /// retained scrollback rows plus primary grid rows. (Valid absolute ids
+    /// span `scrollback().evicted() .. scrollback().evicted() +
+    /// total_rows()`.)
+    ///
+    /// Unaffected by the alternate screen: it has no scrollback and the
+    /// grids share their dimensions.
     pub fn total_rows(&self) -> usize {
         self.scrollback.len() + self.rows()
     }
 
-    /// The stable absolute row id of grid row `grid_row`:
+    /// The stable absolute row id of **primary** grid row `grid_row`:
     /// `evicted + scrollback.len() + grid_row`.
+    ///
+    /// This is a coordinate on the scrollback timeline, so it keeps its
+    /// meaning while the alternate screen is active (the alternate screen
+    /// does not advance the timeline).
     pub fn absolute_row(&self, grid_row: usize) -> usize {
         self.scrollback.evicted() + self.scrollback.len() + grid_row
     }
 
-    /// The absolute row id of the cursor's row.
+    /// The absolute row id of the cursor's row, on the primary timeline.
     pub fn cursor_absolute_row(&self) -> usize {
         self.absolute_row(self.cursor.row)
     }
 
-    /// Fetch a row by absolute id, unified over scrollback and the active
-    /// grid. Returns `None` if the row was evicted or the id is out of
-    /// range.
+    /// Fetch a row by absolute id, unified over scrollback and the
+    /// **primary** grid. Returns `None` if the row was evicted or the id is
+    /// out of range.
+    ///
+    /// Never reads the alternate grid: while a full-screen application is
+    /// running this still returns the primary-screen content that owns
+    /// those absolute ids. Use [`Screen::grid`] to see what is on screen.
     pub fn line(&self, absolute_row: usize) -> Option<Cow<'_, [Cell]>> {
         self.row_slice(absolute_row).map(Cow::Borrowed)
     }
@@ -812,6 +929,8 @@ impl Screen {
     /// The text of the row at `absolute_row`: trailing blank cells are
     /// trimmed and [`CellWidth::WideTrail`] spacers are skipped. Returns
     /// `None` if the row was evicted or out of range.
+    ///
+    /// Reads scrollback plus the **primary** grid, like [`Screen::line`].
     pub fn row_text(&self, absolute_row: usize) -> Option<String> {
         let cells = self.row_slice(absolute_row)?;
         let mut end = cells.len();
@@ -835,6 +954,12 @@ impl Screen {
     /// Project a [`Viewport`] onto the buffer: returns up to `vp.height`
     /// row slices starting at absolute row `vp.top`. Rows that were evicted
     /// or fall past the end of the grid are omitted.
+    ///
+    /// [`Viewport::top`] is an absolute row id, so this addresses the
+    /// **primary** timeline (scrollback plus the primary grid) exactly like
+    /// [`Screen::line`] — including while the alternate screen is active.
+    /// A viewport is a window onto history; to render the live screen, draw
+    /// [`Screen::grid`] instead.
     pub fn viewport_rows(&self, vp: Viewport) -> Vec<&[Cell]> {
         let mut out = Vec::with_capacity(vp.height);
         for abs in vp.top..vp.top.saturating_add(vp.height) {
@@ -853,6 +978,24 @@ impl Screen {
         (0..cols).map(|c| c != 0 && c % 8 == 0).collect()
     }
 
+    /// Blank any [`CellWidth::WideLead`] left stranded in the last column.
+    ///
+    /// Narrowing a grid without reflow can cut a wide pair in half; the
+    /// trail cell falls off the edge and the lead would otherwise claim a
+    /// column it no longer has.
+    fn heal_wide_edge(grid: &mut Grid, blank: Cell) {
+        let Some(last) = grid.cols().checked_sub(1) else {
+            return;
+        };
+        for r in 0..grid.rows() {
+            if let Some(cell) = grid.cell_mut(r, last) {
+                if cell.width == CellWidth::WideLead {
+                    *cell = blank;
+                }
+            }
+        }
+    }
+
     fn grid_active_mut(&mut self) -> &mut Grid {
         if self.alt_active {
             &mut self.alt
@@ -869,7 +1012,14 @@ impl Screen {
         }
     }
 
-    /// Look up a row by absolute id across scrollback and the active grid.
+    /// Look up a row by absolute id across scrollback and the **primary**
+    /// grid.
+    ///
+    /// Deliberately never consults the alternate grid: absolute ids belong
+    /// to the primary screen's timeline, which the alternate screen does
+    /// not advance. Resolving them against the active grid would make a
+    /// full-screen application's frame buffer masquerade as the primary
+    /// content that owns those ids.
     fn row_slice(&self, absolute_row: usize) -> Option<&[Cell]> {
         let evicted = self.scrollback.evicted();
         if absolute_row < evicted {
@@ -879,7 +1029,7 @@ impl Screen {
         if idx < self.scrollback.len() {
             return self.scrollback.row(idx);
         }
-        self.grid().row(idx - self.scrollback.len())
+        self.primary.row(idx - self.scrollback.len())
     }
 
     /// Blank cell used to fill vacated cells: current pen background,

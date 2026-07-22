@@ -33,7 +33,9 @@
 //!
 //! ```
 //! use bb_block_list::{BlockLifecycle, BlockList, PromptMarker};
+//! use bb_terminal_model::Screen;
 //!
+//! let mut screen = Screen::new(24, 80);
 //! let mut blocks = BlockList::new();
 //! // OSC 133;A — shell draws a prompt on absolute row 0.
 //! blocks.on_marker(PromptMarker::PromptStart, 0);
@@ -43,8 +45,8 @@
 //! blocks.set_cwd("/repo");
 //! // OSC 133;C — command starts executing.
 //! blocks.on_marker(PromptMarker::CommandExecuted, 1);
-//! // Output grows; the host reports row progress after each parser feed.
-//! blocks.observe_row(7);
+//! // Output grows; the host reports progress after each parser feed.
+//! blocks.observe_row(&screen);
 //! // OSC 133;D — command exits.
 //! blocks.on_marker(PromptMarker::CommandFinished { exit_code: Some(0) }, 8);
 //! // The block stays open (it visually includes the output) until the
@@ -55,13 +57,18 @@
 //! assert_eq!(done, Some((BlockLifecycle::Finished, Some(true), Some(9))));
 //! ```
 //!
+//! Markers carry the absolute row the parser observed them at, so block
+//! boundaries do not depend on how the host chunked its PTY reads.
+//!
 //! # Heuristic fallback
 //!
-//! Without shell integration no markers ever arrive. Hosts can still call
-//! [`BlockList::observe_row`] after each feed: the first call on a list
-//! that has never seen a marker lazily creates one implicit
-//! [`BlockLifecycle::Running`] block at row 0, so the whole session stays
-//! navigable as a single block.
+//! Without shell integration no markers ever arrive. Hosts still call
+//! [`BlockList::observe_row`] after each feed: the first call that sees a
+//! screen with actual output on a list which has never seen a marker
+//! lazily creates one implicit [`BlockLifecycle::Running`] block at row 0,
+//! so the whole session stays navigable as a single block. Feeds that
+//! print nothing — a partial escape sequence split across PTY reads —
+//! create no block.
 //!
 //! [`beam-beacon-engine`]: https://github.com/MichaelDanCurtis/beam-beacon-engine
 //! [`bb-terminal-model`]: https://docs.rs/bb-terminal-model

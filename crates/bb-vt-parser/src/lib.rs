@@ -23,25 +23,37 @@
 //! - Incremental UTF-8 decoding with chunk-boundary safety (invalid
 //!   bytes decode to U+FFFD)
 //!
+//! # Positioned events
+//!
+//! Every event is returned as a [`PositionedEvent`]: the [`VtEvent`]
+//! itself plus the cursor position *at the instant the parser emitted
+//! it*, captured while the parser still holds the screen. Consumers must
+//! never re-read the cursor after `feed` returns to locate an event —
+//! that reads the position at the *end* of the chunk, which collapses
+//! every marker in the chunk onto one row and makes the result depend on
+//! how the host happened to split its PTY reads.
+//!
 //! # Chunk safety
 //!
 //! [`Parser::feed`] may be called with the stream split at *any* byte
 //! boundary — mid-UTF-8 codepoint, mid-CSI, mid-OSC. All parse state
 //! persists across calls, so feeding a stream byte-at-a-time produces the
-//! exact same screen state and events as feeding it in one call.
+//! exact same screen state and the exact same [`PositionedEvent`]s —
+//! positions included — as feeding it in one call.
 //!
 //! # Example
 //!
 //! ```
 //! use bb_terminal_model::Screen;
-//! use bb_vt_parser::{Parser, VtEvent};
+//! use bb_vt_parser::{Parser, PositionedEvent, VtEvent};
 //!
 //! let mut screen = Screen::new(24, 80);
 //! let mut parser = Parser::new();
 //! let events = parser.feed(&mut screen, b"\x1b[1mhello\x07");
 //! assert_eq!(screen.row_text(screen.absolute_row(0)).as_deref(), Some("hello"));
 //! assert!(screen.pen().bold);
-//! assert_eq!(events, vec![VtEvent::Bell]);
+//! // The bell fired with the cursor just past "hello" on the first row.
+//! assert_eq!(events, vec![PositionedEvent::new(VtEvent::Bell, 0, 5)]);
 //! ```
 //!
 //! [`beam-beacon-engine`]: https://github.com/MichaelDanCurtis/beam-beacon-engine
@@ -54,11 +66,77 @@ mod sgr;
 
 use bb_terminal_model::{CursorShape, EraseMode, Screen};
 
+/// A [`VtEvent`] together with where the terminal cursor was when it
+/// fired.
+///
+/// The position is sampled by the parser at the exact byte that completed
+/// the sequence, before any later byte in the same chunk moves the
+/// cursor. That makes it independent of how the PTY stream was chunked:
+/// the same transcript fed one byte at a time and in one 64 KiB call
+/// yields the identical `Vec<PositionedEvent>`.
+///
+/// This is what makes command-block boundaries correct. A consumer that
+/// instead reads `Screen::cursor_absolute_row()` after `feed` returns
+/// gets the position at the *end* of the chunk for every event in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionedEvent {
+    /// The semantic event.
+    pub event: VtEvent,
+    /// Absolute row (see [`Screen::absolute_row`]) of the cursor when the
+    /// event was emitted. Stable across scrollback eviction.
+    pub cursor_row: usize,
+    /// Cursor column when the event was emitted.
+    pub cursor_col: usize,
+}
+
+impl PositionedEvent {
+    /// Pair `event` with the cursor position it was emitted at.
+    ///
+    /// Mostly useful for building expected values in tests; the parser
+    /// fills these in itself.
+    pub fn new(event: VtEvent, cursor_row: usize, cursor_col: usize) -> Self {
+        Self {
+            event,
+            cursor_row,
+            cursor_col,
+        }
+    }
+
+    /// Discard the position, keeping only the semantic event.
+    ///
+    /// Handy for consumers that only care about *what* happened:
+    /// `events.into_iter().map(PositionedEvent::into_event)`.
+    pub fn into_event(self) -> VtEvent {
+        self.event
+    }
+
+    /// The `(row, col)` the event was emitted at, as a pair.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.cursor_row, self.cursor_col)
+    }
+
+    /// Stamp `event` with `screen`'s current cursor position.
+    fn at(screen: &Screen, event: VtEvent) -> Self {
+        Self {
+            event,
+            cursor_row: screen.cursor_absolute_row(),
+            cursor_col: screen.cursor().col,
+        }
+    }
+}
+
+impl From<PositionedEvent> for VtEvent {
+    fn from(positioned: PositionedEvent) -> Self {
+        positioned.event
+    }
+}
+
 /// Semantic events surfaced by the parser alongside its screen effects.
 ///
 /// These are the signals that higher layers (e.g. the block list) consume
 /// to segment output into blocks, update window chrome, and render
-/// hyperlinks. They are returned by [`Parser::feed`] in stream order.
+/// hyperlinks. They are returned by [`Parser::feed`] in stream order,
+/// each wrapped in a [`PositionedEvent`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VtEvent {
@@ -157,12 +235,15 @@ impl Parser {
         Self::default()
     }
 
-    /// Feed raw PTY bytes; applies effects to `screen`, returns semantic
-    /// events in stream order.
+    /// Feed raw PTY bytes; applies effects to `screen` and returns the
+    /// semantic events in stream order, each carrying the cursor position
+    /// at the instant it fired.
     ///
     /// The byte stream may be split anywhere across calls (mid-UTF-8,
-    /// mid-escape-sequence); all parse state persists in `self`.
-    pub fn feed(&mut self, screen: &mut Screen, bytes: &[u8]) -> Vec<VtEvent> {
+    /// mid-escape-sequence); all parse state persists in `self`, and the
+    /// returned events — positions included — are identical however the
+    /// stream was chunked.
+    pub fn feed(&mut self, screen: &mut Screen, bytes: &[u8]) -> Vec<PositionedEvent> {
         let mut events = Vec::new();
         for &b in bytes {
             self.step(screen, &mut events, b);
@@ -174,7 +255,7 @@ impl Parser {
     // State dispatch
     // -----------------------------------------------------------------
 
-    fn step(&mut self, screen: &mut Screen, events: &mut Vec<VtEvent>, b: u8) {
+    fn step(&mut self, screen: &mut Screen, events: &mut Vec<PositionedEvent>, b: u8) {
         match self.state {
             State::Ground => self.on_ground(screen, events, b),
             State::Escape => self.on_escape(screen, b),
@@ -182,20 +263,20 @@ impl Parser {
             State::CsiParam => self.on_csi_param(screen, b),
             State::CsiIntermediate => self.on_csi_intermediate(screen, b),
             State::CsiIgnore => self.on_csi_ignore(screen, b),
-            State::OscString => self.on_osc_string(events, b),
+            State::OscString => self.on_osc_string(screen, events, b),
             State::OscEscape => self.on_osc_escape(screen, events, b),
             State::StringBody => self.on_string_body(b),
             State::StringEscape => self.on_string_escape(b),
         }
     }
 
-    fn on_ground(&mut self, screen: &mut Screen, events: &mut Vec<VtEvent>, b: u8) {
+    fn on_ground(&mut self, screen: &mut Screen, events: &mut Vec<PositionedEvent>, b: u8) {
         if self.utf8_need > 0 {
             self.utf8_continue(screen, events, b);
             return;
         }
         match b {
-            0x07 => events.push(VtEvent::Bell),
+            0x07 => events.push(PositionedEvent::at(screen, VtEvent::Bell)),
             0x1B => self.enter_escape(),
             0x00..=0x06 | 0x08..=0x1A | 0x1C..=0x1F => Self::execute_ctrl(screen, b),
             0x20..=0x7E => screen.print(char::from(b)),
@@ -298,10 +379,10 @@ impl Parser {
         }
     }
 
-    fn on_osc_string(&mut self, events: &mut Vec<VtEvent>, b: u8) {
+    fn on_osc_string(&mut self, screen: &Screen, events: &mut Vec<PositionedEvent>, b: u8) {
         match b {
             0x07 => {
-                self.osc_dispatch(events);
+                self.osc_dispatch(screen, events);
                 self.state = State::Ground;
             }
             0x1B => self.state = State::OscEscape,
@@ -317,10 +398,10 @@ impl Parser {
         }
     }
 
-    fn on_osc_escape(&mut self, screen: &mut Screen, events: &mut Vec<VtEvent>, b: u8) {
+    fn on_osc_escape(&mut self, screen: &mut Screen, events: &mut Vec<PositionedEvent>, b: u8) {
         if b == b'\\' {
             // ESC \ = ST, the standard OSC terminator.
-            self.osc_dispatch(events);
+            self.osc_dispatch(screen, events);
             self.state = State::Ground;
         } else {
             // ESC followed by anything else aborts the OSC; the ESC then
@@ -684,13 +765,19 @@ impl Parser {
     // OSC dispatch
     // -----------------------------------------------------------------
 
-    fn osc_dispatch(&mut self, events: &mut Vec<VtEvent>) {
+    /// Parse the buffered OSC payload. The cursor position is sampled
+    /// here — at the terminator byte, after everything printed before the
+    /// sequence has been applied — which is precisely where an OSC 133
+    /// marker semantically belongs.
+    fn osc_dispatch(&mut self, screen: &Screen, events: &mut Vec<PositionedEvent>) {
         let buf = std::mem::take(&mut self.osc_buf);
         if self.osc_overflow {
             self.osc_overflow = false;
             return; // overlong OSC: discarded entirely
         }
-        osc::dispatch(&buf, events);
+        if let Some(event) = osc::dispatch(&buf) {
+            events.push(PositionedEvent::at(screen, event));
+        }
     }
 
     // -----------------------------------------------------------------
@@ -713,7 +800,7 @@ impl Parser {
         self.utf8_need = need;
     }
 
-    fn utf8_continue(&mut self, screen: &mut Screen, events: &mut Vec<VtEvent>, b: u8) {
+    fn utf8_continue(&mut self, screen: &mut Screen, events: &mut Vec<PositionedEvent>, b: u8) {
         // The first continuation byte carries lead-specific range limits
         // (rejects overlong encodings, surrogates, and > U+10FFFF).
         let ok = if self.utf8_len == 1 {

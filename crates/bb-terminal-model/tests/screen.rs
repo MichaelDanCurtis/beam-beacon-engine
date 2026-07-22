@@ -14,9 +14,25 @@ fn put(screen: &mut Screen, row: usize, text: &str) {
     }
 }
 
-/// The text of grid row `row` (trailing blanks trimmed).
+/// The text of primary grid row `row` by absolute id (trailing blanks
+/// trimmed). This is the *scrollback timeline* view.
 fn grid_text(screen: &Screen, row: usize) -> String {
     screen.row_text(screen.absolute_row(row)).unwrap()
+}
+
+/// The text of row `row` of the *active* grid — what a renderer would
+/// draw. Differs from [`grid_text`] while the alternate screen is up.
+fn active_text(screen: &Screen, row: usize) -> String {
+    let cells = screen.grid().row(row).unwrap();
+    let end = cells
+        .iter()
+        .rposition(|c| !(c.width == CellWidth::Single && c.ch == ' '))
+        .map_or(0, |i| i + 1);
+    cells[..end]
+        .iter()
+        .filter(|c| c.width != CellWidth::WideTrail)
+        .map(|c| c.ch)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +564,7 @@ fn erase_all_on_alt_screen_does_not_touch_scrollback() {
     put(&mut s, 0, "xxx");
     s.erase_in_display(EraseMode::All);
     assert!(s.scrollback().is_empty());
-    assert_eq!(grid_text(&s, 0), "");
+    assert_eq!(active_text(&s, 0), "");
 }
 
 #[test]
@@ -750,11 +766,98 @@ fn alt_screen_is_isolated_from_primary() {
     put(&mut s, 0, "abc");
     s.enter_alt_screen();
     assert!(s.is_alt_screen());
-    assert_eq!(grid_text(&s, 0), ""); // alt starts blank
+    assert_eq!(active_text(&s, 0), ""); // alt starts blank
     put(&mut s, 0, "xyz");
+    assert_eq!(active_text(&s, 0), "xyz");
     s.exit_alt_screen();
     assert!(!s.is_alt_screen());
-    assert_eq!(grid_text(&s, 0), "abc"); // primary intact
+    assert_eq!(active_text(&s, 0), "abc"); // primary intact
+    assert_eq!(grid_text(&s, 0), "abc");
+}
+
+#[test]
+fn absolute_rows_address_the_primary_grid_while_alt_is_active() {
+    let mut s = Screen::with_scrollback(3, 12, 10);
+    put(&mut s, 0, "$ vim notes");
+    put(&mut s, 1, "opening");
+    put(&mut s, 2, "reading");
+    let abs = [s.absolute_row(0), s.absolute_row(1), s.absolute_row(2)];
+
+    s.enter_alt_screen();
+    for (row, text) in ["ALTUI one", "ALTUI two", "ALTUI three"].iter().enumerate() {
+        put(&mut s, row, text);
+    }
+
+    // `grid()` is what to draw: the app's frame buffer.
+    assert_eq!(active_text(&s, 0), "ALTUI one");
+    assert_eq!(active_text(&s, 2), "ALTUI three");
+
+    // Absolute rows are the scrollback timeline: still the primary screen.
+    assert_eq!(s.row_text(abs[0]).as_deref(), Some("$ vim notes"));
+    assert_eq!(s.row_text(abs[1]).as_deref(), Some("opening"));
+    assert_eq!(s.row_text(abs[2]).as_deref(), Some("reading"));
+    assert_eq!(s.line(abs[1]).unwrap()[0].ch, 'o');
+    assert!(s
+        .viewport_rows(Viewport {
+            top: abs[0],
+            height: 3,
+        })
+        .iter()
+        .all(|row| row.iter().all(|c| c.ch != 'A')));
+
+    // `primary_grid()` reaches the same content directly.
+    assert_eq!(s.primary_grid().cell(0, 0).unwrap().ch, '$');
+    assert_eq!(s.primary_grid().cell(1, 0).unwrap().ch, 'o');
+
+    s.exit_alt_screen();
+    assert_eq!(active_text(&s, 0), "$ vim notes"); // primary restored
+    assert_eq!(s.row_text(abs[2]).as_deref(), Some("reading"));
+}
+
+#[test]
+fn alt_screen_episode_leaves_the_timeline_untouched() {
+    let mut s = Screen::with_scrollback(3, 8, 10);
+    for text in ["out one", "out two", "out three", "out four"] {
+        put(&mut s, 2, text);
+        s.linefeed(); // scrolls the primary screen, feeding scrollback
+    }
+    let len_before = s.scrollback().len();
+    let evicted_before = s.scrollback().evicted();
+    let total_before = s.total_rows();
+    let cursor_abs_before = s.cursor_absolute_row();
+    let timeline_before: Vec<String> = (evicted_before..evicted_before + total_before)
+        .filter_map(|abs| s.row_text(abs))
+        .collect();
+
+    s.enter_alt_screen();
+    put(&mut s, 0, "ALTUI");
+    s.cursor_goto(2, 0);
+    for i in 0..20 {
+        put(&mut s, 2, &format!("ALT {i}"));
+        s.cursor_goto(2, 0);
+        s.linefeed(); // scrolls the alt grid hard
+    }
+    s.scroll_up(2);
+
+    // Nothing about the primary timeline moved.
+    assert_eq!(s.scrollback().len(), len_before);
+    assert_eq!(s.scrollback().evicted(), evicted_before);
+    assert_eq!(s.total_rows(), total_before);
+    assert_eq!(s.cursor_absolute_row(), cursor_abs_before);
+    let timeline_during: Vec<String> = (evicted_before..evicted_before + total_before)
+        .filter_map(|abs| s.row_text(abs))
+        .collect();
+    assert_eq!(timeline_during, timeline_before);
+    for row in &timeline_during {
+        assert!(!row.contains("ALT"), "alt content leaked into {row:?}");
+    }
+
+    s.exit_alt_screen();
+    let timeline_after: Vec<String> = (evicted_before..evicted_before + total_before)
+        .filter_map(|abs| s.row_text(abs))
+        .collect();
+    assert_eq!(timeline_after, timeline_before);
+    assert_eq!(s.scrollback().evicted(), evicted_before);
 }
 
 #[test]
@@ -775,7 +878,7 @@ fn enter_alt_screen_twice_does_not_reclear() {
     s.enter_alt_screen();
     put(&mut s, 0, "abc");
     s.enter_alt_screen(); // no-op
-    assert_eq!(grid_text(&s, 0), "abc");
+    assert_eq!(active_text(&s, 0), "abc");
     s.exit_alt_screen();
     s.exit_alt_screen(); // no-op
     assert!(!s.is_alt_screen());
@@ -788,7 +891,7 @@ fn reentering_alt_screen_clears_previous_alt_contents() {
     put(&mut s, 0, "abc");
     s.exit_alt_screen();
     s.enter_alt_screen();
-    assert_eq!(grid_text(&s, 0), "");
+    assert_eq!(active_text(&s, 0), "");
 }
 
 // ---------------------------------------------------------------------------
@@ -878,10 +981,11 @@ fn viewport_rows_omits_evicted_rows() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn resize_is_destructive_but_keeps_scrollback() {
+fn resize_preserves_content_and_keeps_scrollback() {
     let mut s = Screen::with_scrollback(2, 3, 10);
     put(&mut s, 0, "aaa");
     s.erase_in_display(EraseMode::All); // pushes 2 rows to scrollback
+    put(&mut s, 0, "new");
     s.cursor_goto(1, 2);
     s.set_scroll_region(1, 2);
     s.resize(4, 8);
@@ -889,8 +993,122 @@ fn resize_is_destructive_but_keeps_scrollback() {
     assert_eq!(s.scrollback().len(), 2);
     assert_eq!(s.row_text(0).unwrap(), "aaa");
     assert_eq!(s.scroll_region(), (0, 3));
-    assert_eq!(grid_text(&s, 0), ""); // destructive
+    assert_eq!(grid_text(&s, 0), "new"); // on-screen content survives
     assert!(!s.pending_wrap());
+}
+
+#[test]
+fn resize_growing_keeps_cells_and_attrs_and_blanks_the_new_area() {
+    let mut s = Screen::new(3, 6);
+    s.pen_mut().bold = true;
+    s.pen_mut().fg = Color::Indexed(4);
+    put(&mut s, 0, "row0ab");
+    *s.pen_mut() = CellAttrs::default();
+    put(&mut s, 1, "row1cd");
+    put(&mut s, 2, "row2ef");
+    s.cursor_goto(2, 5);
+
+    s.resize(5, 8);
+    assert_eq!((s.rows(), s.cols()), (5, 8));
+    assert_eq!(grid_text(&s, 0), "row0ab");
+    assert_eq!(grid_text(&s, 1), "row1cd");
+    assert_eq!(grid_text(&s, 2), "row2ef");
+    assert_eq!(grid_text(&s, 3), ""); // new rows are blank
+    assert_eq!(grid_text(&s, 4), "");
+    let kept = s.grid().cell(0, 0).unwrap();
+    assert!(kept.attrs.bold); // attributes survive the resize
+    assert_eq!(kept.attrs.fg, Color::Indexed(4));
+    assert!(!s.grid().cell(1, 0).unwrap().attrs.bold);
+    assert_eq!(*s.grid().cell(0, 6).unwrap(), Cell::default()); // new column
+    assert_eq!((s.cursor().row, s.cursor().col), (2, 5)); // cursor unmoved
+}
+
+#[test]
+fn resize_narrower_truncates_columns_without_reflow() {
+    let mut s = Screen::new(2, 6);
+    put(&mut s, 0, "abcdef");
+    put(&mut s, 1, "ghijkl");
+    s.cursor_goto(0, 0);
+    s.resize(2, 3);
+    assert_eq!(s.cols(), 3);
+    assert_eq!(grid_text(&s, 0), "abc"); // truncated, never rewrapped
+    assert_eq!(grid_text(&s, 1), "ghi");
+}
+
+#[test]
+fn resize_shrinking_rows_sheds_the_top_into_scrollback() {
+    let mut s = Screen::with_scrollback(4, 4, 10);
+    put(&mut s, 0, "aaa");
+    put(&mut s, 1, "bbb");
+    put(&mut s, 2, "ccc");
+    put(&mut s, 3, "ddd");
+    let abs: Vec<usize> = (0..4).map(|r| s.absolute_row(r)).collect();
+    s.cursor_goto(3, 1); // cursor on the last row: the bottom must be kept
+
+    s.resize(2, 4);
+    assert_eq!(s.rows(), 2);
+    assert_eq!(s.scrollback().len(), 2); // two top rows shed, not discarded
+    assert_eq!(s.scrollback().evicted(), 0);
+    assert_eq!(s.total_rows(), 4);
+    // Every row is still addressable at the id it always had.
+    assert_eq!(s.row_text(abs[0]).as_deref(), Some("aaa"));
+    assert_eq!(s.row_text(abs[1]).as_deref(), Some("bbb"));
+    assert_eq!(s.row_text(abs[2]).as_deref(), Some("ccc"));
+    assert_eq!(s.row_text(abs[3]).as_deref(), Some("ddd"));
+    // The bottom of the screen is what stayed on the grid.
+    assert_eq!(active_text(&s, 0), "ccc");
+    assert_eq!(active_text(&s, 1), "ddd");
+    // The cursor followed its own row, so its absolute id is unchanged.
+    assert_eq!((s.cursor().row, s.cursor().col), (1, 1));
+    assert_eq!(s.cursor_absolute_row(), abs[3]);
+}
+
+#[test]
+fn resize_shrinking_rows_drops_the_bottom_when_the_cursor_already_fits() {
+    let mut s = Screen::with_scrollback(4, 4, 10);
+    put(&mut s, 0, "aaa");
+    put(&mut s, 1, "bbb");
+    put(&mut s, 2, "ccc");
+    put(&mut s, 3, "ddd");
+    s.cursor_goto(1, 2);
+    let cursor_abs = s.cursor_absolute_row();
+
+    s.resize(2, 4);
+    assert!(s.scrollback().is_empty()); // nothing had to leave the top
+    assert_eq!(grid_text(&s, 0), "aaa"); // content at and above the cursor kept
+    assert_eq!(grid_text(&s, 1), "bbb");
+    assert_eq!((s.cursor().row, s.cursor().col), (1, 2));
+    assert_eq!(s.cursor_absolute_row(), cursor_abs);
+}
+
+#[test]
+fn resize_on_the_alt_screen_never_feeds_scrollback() {
+    let mut s = Screen::with_scrollback(4, 8, 10);
+    put(&mut s, 0, "p-zero");
+    put(&mut s, 1, "p-one");
+    put(&mut s, 2, "p-two");
+    put(&mut s, 3, "p-three");
+    s.enter_alt_screen();
+    put(&mut s, 0, "a-zero");
+    put(&mut s, 1, "a-one");
+    put(&mut s, 2, "a-two");
+    put(&mut s, 3, "a-three");
+    s.cursor_goto(3, 0); // forces a top shed
+
+    s.resize(2, 8);
+    // The alt grid kept its own bottom, and lost its top without a trace.
+    assert_eq!(active_text(&s, 0), "a-two");
+    assert_eq!(active_text(&s, 1), "a-three");
+    // Only the primary grid's shed rows reached scrollback.
+    assert_eq!(s.scrollback().len(), 2);
+    assert_eq!(s.row_text(0).as_deref(), Some("p-zero"));
+    assert_eq!(s.row_text(1).as_deref(), Some("p-one"));
+    assert_eq!(s.row_text(2).as_deref(), Some("p-two"));
+    assert_eq!(s.row_text(3).as_deref(), Some("p-three"));
+    // Each grid preserved its own content.
+    s.exit_alt_screen();
+    assert_eq!(active_text(&s, 0), "p-two");
+    assert_eq!(active_text(&s, 1), "p-three");
 }
 
 #[test]
@@ -899,6 +1117,104 @@ fn resize_clamps_cursor_into_new_bounds() {
     s.cursor_goto(3, 7);
     s.resize(2, 3);
     assert_eq!((s.cursor().row, s.cursor().col), (1, 2));
+}
+
+#[test]
+fn resize_keeps_the_saved_cursor_sane() {
+    let mut s = Screen::new(4, 8);
+    s.cursor_goto(3, 7);
+    s.save_cursor();
+    s.resize(2, 3); // sheds 2 rows off the top
+    assert_eq!((s.cursor().row, s.cursor().col), (1, 2));
+    s.cursor_goto(0, 0);
+    s.restore_cursor();
+    assert_eq!((s.cursor().row, s.cursor().col), (1, 2)); // saved cursor followed
+}
+
+#[test]
+fn resize_heals_a_wide_pair_split_by_the_new_right_edge() {
+    let mut s = Screen::new(1, 4);
+    put(&mut s, 0, "a你b");
+    s.cursor_goto(0, 0);
+    s.resize(1, 3); // the pair still fits
+    assert_eq!(grid_text(&s, 0), "a你");
+    assert_eq!(s.grid().cell(0, 1).unwrap().width, CellWidth::WideLead);
+
+    let mut s = Screen::new(1, 4);
+    put(&mut s, 0, "a你b");
+    s.cursor_goto(0, 0);
+    s.resize(1, 2); // the trail falls off the edge
+    assert_eq!(grid_text(&s, 0), "a");
+    let orphan = s.grid().cell(0, 1).unwrap();
+    assert_eq!(orphan.ch, ' ');
+    assert_eq!(orphan.width, CellWidth::Single);
+}
+
+#[test]
+fn resize_never_moves_the_cursors_absolute_row() {
+    // Downstream block lists key off `cursor_absolute_row`, so a resize
+    // must never renumber it: rows shed off the top move into scrollback,
+    // which grows by exactly the same amount.
+    for &(rows, cols) in &[
+        (1_usize, 1_usize),
+        (2, 4),
+        (3, 40),
+        (6, 10),
+        (12, 80),
+        (40, 200),
+    ] {
+        for &cursor_row in &[0_usize, 2, 5] {
+            let mut s = Screen::with_scrollback(6, 20, 100);
+            for r in 0..6 {
+                put(&mut s, r, &format!("line {r}"));
+            }
+            s.cursor_goto(cursor_row, 3);
+            let before = s.cursor_absolute_row();
+            s.resize(rows, cols);
+            assert_eq!(
+                s.cursor_absolute_row(),
+                before,
+                "resize({rows}, {cols}) with the cursor on row {cursor_row}"
+            );
+            assert!(s.cursor().row < s.rows());
+            assert!(s.cursor().col < s.cols());
+        }
+    }
+}
+
+#[test]
+fn resize_keeps_block_style_absolute_row_lookups_working() {
+    let mut s = Screen::with_scrollback(5, 16, 100);
+    put(&mut s, 0, "$ tail log");
+    put(&mut s, 1, "before A");
+    put(&mut s, 2, "before B");
+    s.cursor_goto(3, 0);
+    // A block-list-style range of absolute row ids, captured before resize.
+    let block: Vec<usize> = (0..3).map(|r| s.absolute_row(r)).collect();
+    let evicted_before = s.scrollback().evicted();
+
+    s.resize(3, 12); // shrink in both dimensions
+    assert_eq!((s.rows(), s.cols()), (3, 12));
+    assert_eq!(s.scrollback().evicted(), evicted_before);
+
+    let text: Vec<String> = block.iter().filter_map(|&a| s.row_text(a)).collect();
+    assert_eq!(text, ["$ tail log", "before A", "before B"]);
+    // The viewport projection agrees with the per-row lookups.
+    let rows = s.viewport_rows(Viewport {
+        top: block[0],
+        height: 3,
+    });
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].ch, '$');
+    assert_eq!(rows[2][0].ch, 'b');
+
+    // New output lands at the next absolute id, so the block just grows.
+    s.cursor_goto(2, 0);
+    for ch in "after C".chars() {
+        s.print(ch);
+    }
+    assert_eq!(s.absolute_row(2), block[2] + 1);
+    assert_eq!(s.row_text(block[2] + 1).as_deref(), Some("after C"));
 }
 
 #[test]

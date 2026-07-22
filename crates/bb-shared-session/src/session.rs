@@ -13,7 +13,7 @@ use bb_block_list::{BlockList, PromptMarker};
 use bb_providers::ProviderMessage;
 use bb_terminal_model::Screen;
 use bb_tool_bridge::ToolContext;
-use bb_vt_parser::{Parser, VtEvent};
+use bb_vt_parser::{Parser, PositionedEvent, VtEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::IdentityContext;
@@ -93,13 +93,27 @@ pub struct Session {
 
 impl Session {
     /// Create a fresh session; `rows`/`cols` are the initial PTY size.
+    ///
+    /// The screen retains [`Screen::DEFAULT_SCROLLBACK_LINES`] lines of
+    /// history; use [`Session::with_scrollback`] to choose another bound.
     pub fn new(id: SessionId, rows: usize, cols: usize) -> Self {
+        Self::with_scrollback(id, rows, cols, Screen::DEFAULT_SCROLLBACK_LINES)
+    }
+
+    /// Create a fresh session whose screen retains at most
+    /// `max_scrollback` lines of history (see
+    /// [`Screen::with_scrollback`]).
+    ///
+    /// Hosts use this to bound a session's memory; tests use it to reach
+    /// scrollback eviction — and therefore [`Session::prune_blocks`] —
+    /// without generating tens of thousands of rows.
+    pub fn with_scrollback(id: SessionId, rows: usize, cols: usize, max_scrollback: usize) -> Self {
         Self {
             id,
             title: None,
             cwd: None,
             identity: IdentityContext::default(),
-            screen: Screen::new(rows, cols),
+            screen: Screen::with_scrollback(rows, cols, max_scrollback),
             parser: Parser::new(),
             blocks: BlockList::new(),
             conversation: Conversation::new(),
@@ -167,49 +181,68 @@ impl Session {
     /// Feed raw PTY bytes into the session.
     ///
     /// Drives the [`Parser`] into the [`Screen`], then translates the
-    /// semantic [`VtEvent`]s into engine state:
+    /// semantic events into engine state. Every event is a
+    /// [`PositionedEvent`] carrying the absolute cursor row it fired at,
+    /// and *that* row — never the cursor row after the feed — is what the
+    /// block layer is driven with:
     ///
-    /// - OSC 133 prompt markers → [`BlockList::on_marker`], stamped with
-    ///   the cursor's absolute row *after* this feed (feed in small chunks
-    ///   for finer-grained marker rows);
-    /// - [`VtEvent::WorkingDirectory`] → [`BlockList::set_cwd`] and the
-    ///   session cwd. The `file://` URL is parsed leniently: the scheme
-    ///   and host are stripped and the remaining path is used verbatim —
-    ///   **no percent-decoding is performed**. A bare absolute path is
-    ///   accepted as-is; anything unparseable leaves the cwd unchanged;
+    /// - OSC 133 prompt markers → [`BlockList::on_marker`] at the marker's
+    ///   own row;
+    /// - [`VtEvent::WorkingDirectory`] → [`BlockList::set_cwd_at_row`] for
+    ///   the block owning the report's row, plus the session cwd. The
+    ///   `file://` URL is parsed leniently: the scheme and host are
+    ///   stripped and the remaining path is used verbatim — **no
+    ///   percent-decoding is performed**. A bare absolute path is accepted
+    ///   as-is; anything unparseable leaves the cwd unchanged;
     /// - [`VtEvent::Title`] → the session title.
     ///
-    /// After the feed, [`BlockList::observe_row`] is called with the
-    /// current cursor row so open blocks track output growth. The full
-    /// event list is returned for the host UI (bells, hyperlinks, ...).
+    /// # Chunking independence
+    ///
+    /// Block boundaries do **not** depend on how the host split its PTY
+    /// reads. Feeding a transcript in one call, one byte at a time, or cut
+    /// in the middle of every escape sequence produces identical block
+    /// ranges, lifecycles, exit codes and block texts. (There is therefore
+    /// nothing to gain from feeding in small chunks — feed whatever
+    /// `read(2)` returned.)
+    ///
+    /// After the events are dispatched, [`BlockList::observe_row`] is
+    /// called with the live screen so an open block tracks output growth,
+    /// and so a shell with no OSC 133 integration at all still gets its
+    /// single fallback block. That fallback is created only once the
+    /// screen holds real output and no marker has ever been seen, so a
+    /// feed that merely carries a partial escape sequence never
+    /// manufactures an empty leading block.
+    ///
+    /// The full positioned-event list is returned for the host UI, which
+    /// can now locate a [`VtEvent::Bell`] or [`VtEvent::Hyperlink`]
+    /// precisely instead of guessing. Use
+    /// [`PositionedEvent::into_event`] to drop the positions.
     ///
     /// Feeding an empty byte slice is a no-op and returns no events.
-    pub fn feed_pty(&mut self, bytes: &[u8]) -> Vec<VtEvent> {
+    pub fn feed_pty(&mut self, bytes: &[u8]) -> Vec<PositionedEvent> {
         if bytes.is_empty() {
             return Vec::new();
         }
 
         let events = self.parser.feed(&mut self.screen, bytes);
-        let cursor_row = self.screen.cursor_absolute_row();
-        for event in &events {
-            match event {
+        for positioned in &events {
+            let row = positioned.cursor_row;
+            match &positioned.event {
                 VtEvent::PromptStart => {
-                    self.blocks.on_marker(PromptMarker::PromptStart, cursor_row);
+                    self.blocks.on_marker(PromptMarker::PromptStart, row);
                 }
                 VtEvent::CommandStart => {
-                    self.blocks
-                        .on_marker(PromptMarker::CommandStart, cursor_row);
+                    self.blocks.on_marker(PromptMarker::CommandStart, row);
                 }
                 VtEvent::CommandExecuted => {
-                    self.blocks
-                        .on_marker(PromptMarker::CommandExecuted, cursor_row);
+                    self.blocks.on_marker(PromptMarker::CommandExecuted, row);
                 }
                 VtEvent::CommandFinished { exit_code } => {
                     self.blocks.on_marker(
                         PromptMarker::CommandFinished {
                             exit_code: *exit_code,
                         },
-                        cursor_row,
+                        row,
                     );
                 }
                 VtEvent::Title(title) => {
@@ -217,7 +250,7 @@ impl Session {
                 }
                 VtEvent::WorkingDirectory(url) => {
                     if let Some(path) = parse_file_url_path(url) {
-                        self.blocks.set_cwd(&path);
+                        self.blocks.set_cwd_at_row(row, &path);
                         self.cwd = Some(path);
                     }
                 }
@@ -227,7 +260,7 @@ impl Session {
                 _ => {}
             }
         }
-        self.blocks.observe_row(self.screen.cursor_absolute_row());
+        self.blocks.observe_row(&self.screen);
         events
     }
 
@@ -237,12 +270,44 @@ impl Session {
     }
 
     /// The block list view over the screen.
+    ///
+    /// Deliberately read-only. The block list is a *derived* view that
+    /// [`Session::feed_pty`] keeps in lockstep with the screen; handing
+    /// out `&mut BlockList` would let a host drive [`BlockList::on_marker`]
+    /// with rows the screen never produced and silently desynchronize the
+    /// two. Every mutation a host legitimately needs has a dedicated
+    /// method here: [`Session::record_command`],
+    /// [`Session::record_command_at_row`] and [`Session::prune_blocks`].
+    /// If a host ever needs more, add another narrow method rather than
+    /// opening the whole aggregate.
     pub fn blocks(&self) -> &BlockList {
         &self.blocks
     }
 
+    /// Drop blocks whose rows have all been evicted from scrollback,
+    /// returning how many were dropped.
+    ///
+    /// Blocks outlive their text: the list keeps one entry (with its
+    /// command and cwd strings) per command for the life of the session,
+    /// long after the rows it points at have scrolled out of the retained
+    /// scrollback and its [`BlockList::block_text`] has gone empty. A host
+    /// should call this periodically — after a burst of output, on an idle
+    /// tick, or whenever `session.blocks().len()` crosses whatever bound
+    /// it wants — to keep a long-lived session's memory flat.
+    ///
+    /// Pruning never renumbers: surviving [`BlockId`](bb_block_list::BlockId)s
+    /// keep their values, so a host holding an id for a pruned block simply
+    /// gets `None` from [`BlockList::get`]. The still-open newest block is
+    /// never pruned. Calling it twice in a row prunes nothing the second
+    /// time.
+    pub fn prune_blocks(&mut self) -> usize {
+        self.blocks.prune_evicted(&self.screen)
+    }
+
     /// Resize the PTY view. Blocks (absolute-row addressed) and the
-    /// conversation are unaffected.
+    /// conversation are unaffected, and [`Screen::resize`] preserves
+    /// on-screen content, so a block's text survives the resize (modulo
+    /// columns dropped past a narrower right edge — there is no reflow).
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.screen.resize(rows, cols);
     }
@@ -250,9 +315,26 @@ impl Session {
     /// Record the command line the user submitted (shell integration).
     ///
     /// Attaches to the latest block via [`BlockList::set_command`]; a
-    /// no-op when no block exists yet.
+    /// no-op when no block exists yet. This is what a live host calls: it
+    /// records the command the instant the user hits Enter, when the
+    /// newest block is necessarily the one being composed.
     pub fn record_command(&mut self, command: &str) {
         self.blocks.set_command(command);
+    }
+
+    /// Record the command line for the block that owns absolute row
+    /// `abs_row`, returning whether a block owned it.
+    ///
+    /// Use this when the command is being attributed *from* the event
+    /// stream — a host replaying a transcript or reattaching to a live
+    /// session can see several commands' `OSC 133;B` markers in a single
+    /// [`Session::feed_pty`] call, and [`Session::record_command`] would
+    /// then pile all of them onto the newest block. Pass the
+    /// [`PositionedEvent::cursor_row`] of the [`VtEvent::CommandStart`]
+    /// the command belongs to and attribution stops depending on how the
+    /// PTY stream was chunked.
+    pub fn record_command_at_row(&mut self, abs_row: usize, command: &str) -> bool {
+        self.blocks.set_command_at_row(abs_row, command)
     }
 
     // ------------------------------------------------------------------
@@ -337,6 +419,14 @@ mod tests {
         Session::new(SessionId("test".to_owned()), 24, 80)
     }
 
+    /// The semantic events of a feed, positions dropped.
+    fn kinds(events: Vec<PositionedEvent>) -> Vec<VtEvent> {
+        events
+            .into_iter()
+            .map(PositionedEvent::into_event)
+            .collect()
+    }
+
     #[test]
     fn session_id_generate_is_unique_and_hex() {
         let mut seen = HashSet::new();
@@ -359,7 +449,7 @@ mod tests {
 
         // Prompt on row 0.
         let ev = s.feed_pty(b"\x1b]133;A\x07$ ");
-        assert_eq!(ev, vec![VtEvent::PromptStart]);
+        assert_eq!(ev, vec![PositionedEvent::new(VtEvent::PromptStart, 0, 0)]);
         s.feed_pty(b"\x1b]133;B\x07");
         s.record_command("echo hi");
         // Command echoed, then execution begins on row 1.
@@ -369,7 +459,10 @@ mod tests {
             b"\x1b]0;my session\x07\x1b]7;file://myhost/Users/me/proj\x07\
               hi\r\n\x07\x1b]8;;https://example.com\x07link\x1b]8;;\x07more\r\n",
         );
-        assert!(ev.contains(&VtEvent::Bell));
+        // The bell fired on row 2, after `hi` had already scrolled the
+        // cursor down — the position is the event's own, not the feed's.
+        assert!(ev.contains(&PositionedEvent::new(VtEvent::Bell, 2, 0)));
+        let ev = kinds(ev);
         assert!(ev.contains(&VtEvent::Hyperlink(Some("https://example.com".to_owned()))));
         assert!(ev.contains(&VtEvent::Hyperlink(None)));
         assert!(ev.contains(&VtEvent::Title("my session".to_owned())));
@@ -454,6 +547,111 @@ mod tests {
         s.feed_pty(b"\x1b]133;B\x07");
         s.record_command("cargo test");
         assert_eq!(s.blocks().latest().unwrap().command(), Some("cargo test"));
+    }
+
+    #[test]
+    fn record_command_at_row_attributes_to_the_owning_block() {
+        // Two whole commands in one coalesced read: `record_command`
+        // could only ever reach the newest block, `record_command_at_row`
+        // reaches the right one.
+        let mut s = session();
+        let events = s.feed_pty(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\
+              \x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+        );
+        let starts: Vec<usize> = events
+            .iter()
+            .filter(|e| e.event == VtEvent::CommandStart)
+            .map(|e| e.cursor_row)
+            .collect();
+        assert_eq!(starts.len(), 2);
+        for (row, cmd) in starts.iter().zip(["one", "two"]) {
+            assert!(s.record_command_at_row(*row, cmd));
+        }
+        let commands: Vec<Option<&str>> = s.blocks().blocks().map(|b| b.command()).collect();
+        assert_eq!(commands, vec![Some("one"), Some("two")]);
+
+        // The newest block is still open, so it owns every row from its
+        // start onward — including rows the screen has not reached yet.
+        assert!(s.record_command_at_row(usize::MAX, "two"));
+        // A fresh session owns no rows at all: a no-op, not a panic.
+        let mut empty = session();
+        assert!(!empty.record_command_at_row(0, "nope"));
+        assert!(empty.blocks().is_empty());
+    }
+
+    #[test]
+    fn feed_pty_does_not_manufacture_a_block_for_a_partial_escape() {
+        // An OSC 133 introducer split across two PTY reads.
+        let mut s = Session::new(SessionId("x".to_owned()), 24, 80);
+        s.feed_pty(b"\x1b");
+        assert!(s.blocks().is_empty(), "a lone ESC created a block");
+        s.feed_pty(b"]133;A\x07");
+        assert_eq!(s.blocks().len(), 1);
+
+        // Bash enabling bracketed paste before it draws its first prompt.
+        let mut s = Session::new(SessionId("y".to_owned()), 24, 80);
+        s.feed_pty(b"\x1b[?2004h");
+        assert!(s.blocks().is_empty(), "a mode set created a block");
+        s.feed_pty(b"\x1b]133;A\x07$ ");
+        assert_eq!(s.blocks().len(), 1);
+        assert_eq!(s.blocks().latest().unwrap().start_row(), 0);
+    }
+
+    #[test]
+    fn with_scrollback_bounds_history_and_new_keeps_the_default() {
+        let mut small = Session::with_scrollback(SessionId("s".to_owned()), 4, 20, 2);
+        assert_eq!(small.screen().scrollback().max_lines(), 2);
+        for i in 0..20 {
+            small.feed_pty(format!("line {i}\r\n").as_bytes());
+        }
+        assert!(small.screen().scrollback().evicted() > 0);
+        assert_eq!(small.screen().scrollback().len(), 2);
+
+        // `Session::new` is exactly `with_scrollback` at the screen's
+        // default capacity — same screen, byte for byte.
+        let mut default = Session::new(SessionId("d".to_owned()), 4, 20);
+        let mut explicit = Session::with_scrollback(
+            SessionId("e".to_owned()),
+            4,
+            20,
+            Screen::DEFAULT_SCROLLBACK_LINES,
+        );
+        assert_eq!(
+            default.screen().scrollback().max_lines(),
+            Screen::DEFAULT_SCROLLBACK_LINES
+        );
+        for i in 0..20 {
+            let line = format!("line {i}\r\n");
+            default.feed_pty(line.as_bytes());
+            explicit.feed_pty(line.as_bytes());
+        }
+        assert_eq!(default.screen(), explicit.screen());
+        assert_eq!(default.screen().scrollback().evicted(), 0);
+    }
+
+    #[test]
+    fn prune_blocks_drops_only_fully_evicted_blocks() {
+        let mut s = Session::with_scrollback(SessionId("p".to_owned()), 4, 40, 2);
+        for i in 0..6 {
+            s.feed_pty(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            s.record_command(&format!("cmd {i}"));
+            s.feed_pty(format!("cmd {i}\r\n\x1b]133;C\x07out {i}\r\n\x1b]133;D;0\x07").as_bytes());
+        }
+        s.feed_pty(b"\x1b]133;A\x07");
+        assert_eq!(s.blocks().len(), 7);
+        assert!(s.screen().scrollback().evicted() > 0);
+
+        let ids_before: Vec<u64> = s.blocks().blocks().map(|b| b.id().0).collect();
+        let pruned = s.prune_blocks();
+        assert!(pruned > 0, "fully evicted blocks should have been pruned");
+        let ids_after: Vec<u64> = s.blocks().blocks().map(|b| b.id().0).collect();
+        // Pruning drops a prefix and never renumbers the survivors.
+        assert_eq!(ids_after, ids_before[pruned..]);
+        // ...and it is idempotent.
+        assert_eq!(s.prune_blocks(), 0);
+        // The still-open newest block always survives.
+        assert!(s.blocks().latest().unwrap().end_row().is_none());
     }
 
     #[test]

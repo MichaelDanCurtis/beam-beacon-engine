@@ -19,10 +19,18 @@
 //!
 //! # Absolute row ids
 //!
-//! Rows never change identity: grid row `r` has absolute id
+//! Rows never change identity: *primary* grid row `r` has absolute id
 //! `scrollback.evicted() + scrollback.len() + r`, and once a row scrolls
 //! into (and eventually out of) scrollback its id is never reused. See
 //! [`Screen::absolute_row`], [`Screen::line`], and [`Screen::row_text`].
+//!
+//! Absolute rows are a coordinate on the primary screen's timeline, which
+//! the alternate screen never advances, and a resize preserves them. So
+//! there are two distinct views of a [`Screen`]: [`Screen::grid`] is the
+//! *active* grid — what a renderer draws — while absolute rows always
+//! address scrollback plus [`Screen::primary_grid`]. While a full-screen
+//! application owns the alternate screen the two disagree, and both are
+//! right.
 //!
 //! # Feature flags
 //!
