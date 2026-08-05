@@ -17,12 +17,74 @@ use crate::cell::Cell;
 /// overflow or an allocation the machine cannot serve. There is no lower
 /// clamp — a zero-sized grid is legal here (but not for
 /// [`crate::Screen`], which clamps up to `1 × 1`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// # Representation
+///
+/// Internally the rows form a **ring**: `first` is the physical index of
+/// logical row 0, and a full-height scroll just advances `first` and
+/// blanks the vacated rows instead of moving every cell. This is what
+/// makes scrolling O(cols) rather than O(rows × cols) — the single
+/// hottest operation a terminal performs. The ring is invisible from the
+/// outside: every accessor speaks logical rows, equality compares logical
+/// contents, and the serde format is the normalized row-major layout.
+#[derive(Debug, Clone)]
 pub struct Grid {
     rows: usize,
     cols: usize,
+    /// Physical index of logical row 0 (always `< rows` when `rows > 0`).
+    first: usize,
     cells: Vec<Cell>,
+}
+
+impl PartialEq for Grid {
+    /// Logical comparison: two grids are equal when their dimensions and
+    /// row contents match, regardless of where each ring happens to start.
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+            && self.cols == other.cols
+            && (0..self.rows).all(|r| self.row(r) == other.row(r))
+    }
+}
+
+impl Eq for Grid {}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Grid {
+    /// Serializes the **normalized** layout (logical row order, no ring
+    /// offset), so the persisted format is identical to the pre-ring
+    /// representation and independent of scroll history.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut cells: Vec<Cell> = Vec::with_capacity(self.cells.len());
+        for r in 0..self.rows {
+            if let Some(row) = self.row(r) {
+                cells.extend_from_slice(row);
+            }
+        }
+        let mut s = serializer.serialize_struct("Grid", 3)?;
+        s.serialize_field("rows", &self.rows)?;
+        s.serialize_field("cols", &self.cols)?;
+        s.serialize_field("cells", &cells)?;
+        s.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Grid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Normalized {
+            rows: usize,
+            cols: usize,
+            cells: Vec<Cell>,
+        }
+        let n = Normalized::deserialize(deserializer)?;
+        Ok(Self {
+            rows: n.rows,
+            cols: n.cols,
+            first: 0,
+            cells: n.cells,
+        })
+    }
 }
 
 impl Grid {
@@ -59,7 +121,19 @@ impl Grid {
         Self {
             rows,
             cols,
+            first: 0,
             cells: vec![Cell::default(); cells],
+        }
+    }
+
+    /// Physical index of logical `row` (caller guarantees `row < rows`).
+    #[inline]
+    fn phys_row(&self, row: usize) -> usize {
+        let p = self.first + row;
+        if p >= self.rows {
+            p - self.rows
+        } else {
+            p
         }
     }
 
@@ -91,7 +165,7 @@ impl Grid {
     /// Read the cell at `(row, col)`. Returns `None` if out of bounds.
     pub fn cell(&self, row: usize, col: usize) -> Option<&Cell> {
         if row < self.rows && col < self.cols {
-            self.cells.get(row * self.cols + col)
+            self.cells.get(self.phys_row(row) * self.cols + col)
         } else {
             None
         }
@@ -100,7 +174,7 @@ impl Grid {
     /// Mutate the cell at `(row, col)`. Returns `None` if out of bounds.
     pub fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
         if row < self.rows && col < self.cols {
-            let idx = row * self.cols + col;
+            let idx = self.phys_row(row) * self.cols + col;
             self.cells.get_mut(idx)
         } else {
             None
@@ -110,7 +184,7 @@ impl Grid {
     /// Borrow a row's cells in column order. Returns `None` if out of bounds.
     pub fn row(&self, row: usize) -> Option<&[Cell]> {
         if row < self.rows {
-            let start = row * self.cols;
+            let start = self.phys_row(row) * self.cols;
             self.cells.get(start..start + self.cols)
         } else {
             None
@@ -121,7 +195,7 @@ impl Grid {
     /// of bounds.
     pub fn row_mut(&mut self, row: usize) -> Option<&mut [Cell]> {
         if row < self.rows {
-            let start = row * self.cols;
+            let start = self.phys_row(row) * self.cols;
             self.cells.get_mut(start..start + self.cols)
         } else {
             None
@@ -130,6 +204,7 @@ impl Grid {
 
     /// Reset every cell to the default (blank space, default attrs).
     pub fn clear(&mut self) {
+        self.first = 0;
         self.fill(Cell::default());
     }
 
@@ -161,16 +236,28 @@ impl Grid {
         }
         let height = bottom - top + 1;
         let n = n.min(height);
-        let start = top * self.cols;
-        let end = (bottom + 1) * self.cols;
-        if let Some(span) = self.cells.get_mut(start..end) {
-            span.rotate_left(n * self.cols);
-            let blank_from = span.len() - n * self.cols;
-            if let Some(tail) = span.get_mut(blank_from..) {
-                for c in tail {
-                    *c = blank;
-                }
+
+        // Full-height scroll: advance the ring start instead of moving a
+        // single cell. This is the path every ordinary linefeed at the
+        // bottom of the screen takes, so it is the one that must be cheap.
+        if top == 0 && bottom == self.rows - 1 {
+            self.first = (self.first + n) % self.rows;
+            for r in self.rows - n..self.rows {
+                self.fill_row(r, blank);
             }
+            return;
+        }
+
+        // Partial region: move row contents. Iterate top-down so every
+        // source row is read before it is overwritten; each row is
+        // physically contiguous, so `copy_within` is one memmove.
+        for r in top..=bottom - n {
+            let src = self.phys_row(r + n) * self.cols;
+            let dst = self.phys_row(r) * self.cols;
+            self.cells.copy_within(src..src + self.cols, dst);
+        }
+        for r in bottom + 1 - n..=bottom {
+            self.fill_row(r, blank);
         }
     }
 
@@ -185,15 +272,25 @@ impl Grid {
         }
         let height = bottom - top + 1;
         let n = n.min(height);
-        let start = top * self.cols;
-        let end = (bottom + 1) * self.cols;
-        if let Some(span) = self.cells.get_mut(start..end) {
-            span.rotate_right(n * self.cols);
-            if let Some(head) = span.get_mut(..n * self.cols) {
-                for c in head {
-                    *c = blank;
-                }
+
+        // Full-height scroll: rewind the ring start (see scroll_up_within).
+        if top == 0 && bottom == self.rows - 1 {
+            self.first = (self.first + self.rows - n) % self.rows;
+            for r in 0..n {
+                self.fill_row(r, blank);
             }
+            return;
+        }
+
+        // Partial region: move row contents bottom-up so sources are read
+        // before being overwritten.
+        for r in (top + n..=bottom).rev() {
+            let src = self.phys_row(r - n) * self.cols;
+            let dst = self.phys_row(r) * self.cols;
+            self.cells.copy_within(src..src + self.cols, dst);
+        }
+        for r in top..top + n {
+            self.fill_row(r, blank);
         }
     }
 
@@ -211,6 +308,7 @@ impl Grid {
         let (rows, cols, cells) = Self::clamped(rows, cols);
         self.rows = rows;
         self.cols = cols;
+        self.first = 0;
         self.cells.clear();
         self.cells.resize(cells, Cell::default());
     }
@@ -247,7 +345,9 @@ impl Grid {
         let copy_rows = self.rows.min(rows);
         let copy_cols = self.cols.min(cols);
         for r in 0..copy_rows {
-            let src = self.cells.get(r * self.cols..r * self.cols + copy_cols);
+            // `self.row` resolves the ring, so the new buffer comes out
+            // normalized (`first == 0`).
+            let src = self.row(r).and_then(|row| row.get(..copy_cols));
             let dst = cells.get_mut(r * cols..r * cols + copy_cols);
             if let (Some(src), Some(dst)) = (src, dst) {
                 dst.copy_from_slice(src);
@@ -255,6 +355,7 @@ impl Grid {
         }
         self.rows = rows;
         self.cols = cols;
+        self.first = 0;
         self.cells = cells;
     }
 }

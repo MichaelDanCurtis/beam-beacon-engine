@@ -46,6 +46,29 @@ impl Scrollback {
         self.rows.push_back(row);
     }
 
+    /// Push a copy of `cells` as the newest retained row.
+    ///
+    /// Semantically identical to `push_row(cells.to_vec())`, but once the
+    /// ring is full the evicted row's buffer is reused for the copy, so
+    /// steady-state scrolling — the common case in a busy terminal —
+    /// performs no allocation at all.
+    pub fn push_row_copy(&mut self, cells: &[Cell]) {
+        if self.max_lines == 0 {
+            self.evicted += 1;
+            return;
+        }
+        if self.rows.len() >= self.max_lines {
+            self.evicted += 1;
+            if let Some(mut buf) = self.rows.pop_front() {
+                buf.clear();
+                buf.extend_from_slice(cells);
+                self.rows.push_back(buf);
+                return;
+            }
+        }
+        self.rows.push_back(cells.to_vec());
+    }
+
     /// Drop every retained row.
     ///
     /// Dropped rows are counted as **evicted**, exactly as if they had
