@@ -549,10 +549,15 @@ impl BlockList {
         if !scrollback.is_empty() || scrollback.evicted() > 0 {
             return true;
         }
-        (0..screen.rows()).any(|row| {
-            screen
-                .row_text(screen.absolute_row(row))
-                .is_some_and(|text| !text.is_empty())
+        // Equivalent to "some row's `row_text` is non-empty" — a row's
+        // text is non-empty exactly when it holds a non-space character —
+        // but scans cells directly. This runs on *every* feed until the
+        // first output appears, so it must not allocate a String per row
+        // per feed the way `row_text` does.
+        let grid = screen.primary_grid();
+        (0..grid.rows()).any(|row| {
+            grid.row(row)
+                .is_some_and(|cells| cells.iter().any(|cell| cell.ch != ' '))
         })
     }
 

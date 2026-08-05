@@ -364,6 +364,89 @@ impl Screen {
         }
     }
 
+    /// Print every character of `s` as if by repeated [`Screen::print`].
+    ///
+    /// Semantically identical to `for ch in s.chars() { screen.print(ch) }`
+    /// — the crate's chunk-equivalence tests hold it to that — but runs of
+    /// single-width characters are written in one pass instead of paying
+    /// the full per-character path (width lookup, wide-pair healing, cell
+    /// addressing) for every cell. Wide pairs straddling a run's edges are
+    /// healed exactly as `print` would; pairs wholly inside the run are
+    /// simply overwritten.
+    ///
+    /// This is the parser's hot path for plain text; hosts echoing strings
+    /// can use it directly.
+    pub fn print_str(&mut self, s: &str) {
+        let mut chars = s.chars();
+        while let Some(ch) = chars.next() {
+            // Anything that needs the full state machine goes through
+            // `print`: wide and zero-width chars, insert mode, and a
+            // pending wrap (which may scroll).
+            let single = UnicodeWidthChar::width(ch) == Some(1);
+            if !single || self.insert_mode || self.pending_wrap {
+                self.print(ch);
+                continue;
+            }
+
+            let cols = self.cols();
+            let row = self.cursor.row.min(self.rows() - 1);
+            let col = self.cursor.col.min(cols - 1);
+            let free = cols - col;
+
+            // Collect the burst: `ch` plus as many further single-width
+            // chars as fit in the rest of this row. `as_str` lets us peek
+            // without consuming past the first char that breaks the run.
+            let rest = chars.as_str();
+            let mut burst = 1usize;
+            let mut consumed = 0usize;
+            for next in rest.chars() {
+                if burst == free || UnicodeWidthChar::width(next) != Some(1) {
+                    break;
+                }
+                burst += 1;
+                consumed += next.len_utf8();
+            }
+            chars = rest
+                .get(consumed..)
+                .map(str::chars)
+                .unwrap_or_else(|| "".chars());
+
+            // Heal wide pairs cut by the span's edges; interior pairs are
+            // fully overwritten below. (Matches `print`, which heals at
+            // every written cell — interior heals are no-ops here because
+            // both halves get new content.)
+            self.clean_wide_at(row, col);
+            if burst > 1 {
+                self.clean_wide_at(row, col + burst - 1);
+            }
+
+            let attrs = self.pen;
+            let grid = self.grid_active_mut();
+            if let Some(cells) = grid.row_mut(row) {
+                if let Some(span) = cells.get_mut(col..col + burst) {
+                    let mut it = std::iter::once(ch).chain(rest.chars());
+                    for cell in span {
+                        if let Some(c) = it.next() {
+                            *cell = Cell {
+                                ch: c,
+                                attrs,
+                                width: CellWidth::Single,
+                            };
+                        }
+                    }
+                }
+            }
+
+            let end = col + burst;
+            if end >= cols {
+                self.cursor.col = cols - 1;
+                self.pending_wrap = true;
+            } else {
+                self.cursor.col = end;
+            }
+        }
+    }
+
     // -------------------------------------------------------------------
     // Control operations
     // -------------------------------------------------------------------
@@ -581,8 +664,7 @@ impl Screen {
                     if let Some(last) = Self::last_non_blank_row(&self.primary) {
                         for r in 0..=last {
                             if let Some(cells) = self.primary.row(r) {
-                                let owned = cells.to_vec();
-                                self.scrollback.push_row(owned);
+                                self.scrollback.push_row_copy(cells);
                             }
                         }
                     }
@@ -928,8 +1010,7 @@ impl Screen {
             // moving into scrollback.
             for r in 0..primary_shed {
                 if let Some(cells) = self.primary.row(r) {
-                    let owned = cells.to_vec();
-                    self.scrollback.push_row(owned);
+                    self.scrollback.push_row_copy(cells);
                 }
             }
             self.primary
@@ -1333,8 +1414,7 @@ impl Screen {
         if !self.alt_active && top == 0 && bottom == self.rows() - 1 {
             for r in top..top + n {
                 if let Some(cells) = self.primary.row(r) {
-                    let owned = cells.to_vec();
-                    self.scrollback.push_row(owned);
+                    self.scrollback.push_row_copy(cells);
                 }
             }
         }

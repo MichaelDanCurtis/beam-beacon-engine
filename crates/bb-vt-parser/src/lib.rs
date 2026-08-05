@@ -91,10 +91,20 @@ pub struct PositionedEvent {
     pub cursor_row: usize,
     /// Cursor column when the event was emitted.
     pub cursor_col: usize,
+    /// Whether the **alternate screen** was active when the event fired.
+    ///
+    /// Absolute rows address the primary screen's timeline, so a
+    /// row-addressed consumer (a block list) must not act on rows carried
+    /// by alt-screen events — a TUI's cursor position is meaningless on
+    /// that timeline. Carrying the flag here lets consumers feed whole
+    /// PTY chunks without splitting them just to sample this state
+    /// between escape sequences.
+    pub alt_screen: bool,
 }
 
 impl PositionedEvent {
-    /// Pair `event` with the cursor position it was emitted at.
+    /// Pair `event` with the cursor position it was emitted at (on the
+    /// primary screen; see [`PositionedEvent::new_alt`]).
     ///
     /// Mostly useful for building expected values in tests; the parser
     /// fills these in itself.
@@ -103,6 +113,18 @@ impl PositionedEvent {
             event,
             cursor_row,
             cursor_col,
+            alt_screen: false,
+        }
+    }
+
+    /// [`PositionedEvent::new`], but for an event fired while the
+    /// alternate screen was active.
+    pub fn new_alt(event: VtEvent, cursor_row: usize, cursor_col: usize) -> Self {
+        Self {
+            event,
+            cursor_row,
+            cursor_col,
+            alt_screen: true,
         }
     }
 
@@ -125,6 +147,7 @@ impl PositionedEvent {
             event,
             cursor_row: screen.cursor_absolute_row(),
             cursor_col: screen.cursor().col,
+            alt_screen: screen.is_alt_screen(),
         }
     }
 }
@@ -245,8 +268,30 @@ impl Parser {
     /// stream was chunked.
     pub fn feed(&mut self, screen: &mut Screen, bytes: &[u8]) -> Vec<PositionedEvent> {
         let mut events = Vec::new();
-        for &b in bytes {
-            self.step(screen, &mut events, b);
+        let mut i = 0;
+        while i < bytes.len() {
+            // Fast path: in ground state with no pending UTF-8, a run of
+            // printable ASCII needs no state machine at all — hand the
+            // whole run to the screen in one call. `Screen::print_str` is
+            // semantically identical to printing char-by-char (the
+            // chunk-equivalence tests feed the same input byte-at-a-time,
+            // which takes the per-byte path below, and assert identical
+            // screens), so this changes throughput, not behavior.
+            if self.state == State::Ground && self.utf8_need == 0 {
+                let run = bytes[i..]
+                    .iter()
+                    .take_while(|&&b| (0x20..=0x7E).contains(&b))
+                    .count();
+                if run >= 2 {
+                    if let Ok(text) = std::str::from_utf8(&bytes[i..i + run]) {
+                        screen.print_str(text);
+                        i += run;
+                        continue;
+                    }
+                }
+            }
+            self.step(screen, &mut events, bytes[i]);
+            i += 1;
         }
         events
     }

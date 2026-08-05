@@ -257,22 +257,17 @@ impl Session {
             return Vec::new();
         }
 
-        let mut all = Vec::new();
-        for segment in escape_segments(bytes) {
-            let events = self.parser.feed(&mut self.screen, segment);
-            // Sampled *after* the segment, which is exactly when the
-            // segment's own events fired: a segment holds at most one
-            // escape sequence, and a sequence either switches screens (a
-            // CSI or RIS, which emits no event) or emits an event (an OSC,
-            // which cannot switch screens) — never both.
-            let alt_screen = self.screen.is_alt_screen();
-            for positioned in &events {
-                self.dispatch_event(positioned, alt_screen);
-            }
-            all.extend(events);
+        // Every event carries the alt-screen state sampled by the parser
+        // at the instant it fired, so the whole chunk goes to the parser
+        // in one call — no ESC-boundary splitting, which used to cost a
+        // separate parser call (and event Vec) per escape sequence on
+        // SGR-heavy output.
+        let events = self.parser.feed(&mut self.screen, bytes);
+        for positioned in &events {
+            self.dispatch_event(positioned, positioned.alt_screen);
         }
         self.blocks.observe_row(&self.screen);
-        all
+        events
     }
 
     /// Apply one parser event to the session's state.
@@ -432,40 +427,6 @@ impl Session {
             .run_turn(&mut self.conversation, input, &tool_ctx, cancel, events_tx)
             .await
     }
-}
-
-/// Split `bytes` so that no segment contains more than one escape
-/// sequence: every `ESC` begins a new segment.
-///
-/// This is what lets [`Session::feed_pty`] know whether the alternate
-/// screen was active *at the instant each event fired* rather than merely
-/// at the end of the PTY read. Screens are switched by escape sequences
-/// (`CSI ? 1049 h` and friends, or `RIS`) and nothing else, and the parser
-/// recognises no 8-bit C1 controls, so an `ESC`-delimited segment can
-/// switch screens at most once — and if it does, it emits no event, since
-/// only OSC sequences emit events and a segment holds at most one
-/// sequence. Sampling `is_alt_screen()` once per segment is therefore
-/// exact.
-///
-/// The parser is chunk-independent, so splitting changes nothing about the
-/// screen state or the events produced: feeding the segments in order is
-/// byte-for-byte equivalent to feeding `bytes` whole.
-///
-/// Never yields an empty segment (`Parser::feed` on one is a no-op
-/// anyway), and yields exactly one segment for input with no `ESC` at all.
-fn escape_segments(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
-    const ESC: u8 = 0x1b;
-    let mut start = 0;
-    // `..=len` so the final segment is flushed after the last byte.
-    (0..=bytes.len()).filter_map(move |index| {
-        let boundary = index == bytes.len() || bytes.get(index) == Some(&ESC);
-        if !boundary || index == start {
-            return None;
-        }
-        let segment = bytes.get(start..index);
-        start = index;
-        segment
-    })
 }
 
 /// Extract a filesystem path from an OSC 7 `file://` URL, leniently.
@@ -812,24 +773,6 @@ mod tests {
                 "command {i} was lost"
             );
         }
-    }
-
-    #[test]
-    fn escape_segments_splits_at_every_escape_only() {
-        let split =
-            |bytes: &'static [u8]| -> Vec<&'static [u8]> { escape_segments(bytes).collect() };
-        assert_eq!(split(b""), Vec::<&[u8]>::new());
-        assert_eq!(split(b"plain text"), vec![&b"plain text"[..]]);
-        assert_eq!(
-            split(b"ab\x1b[?1049h\x1b]133;A\x07cd"),
-            vec![&b"ab"[..], b"\x1b[?1049h", b"\x1b]133;A\x07cd"]
-        );
-        // A leading escape must not produce an empty first segment.
-        assert_eq!(split(b"\x1bc"), vec![&b"\x1bc"[..]]);
-        assert_eq!(split(b"\x1b\x1b"), vec![&b"\x1b"[..], b"\x1b"]);
-        // Reassembling the segments reproduces the input exactly.
-        let bytes = b"\x1b]0;t\x07x\x1b[1;1Hy\x1b";
-        assert_eq!(split(bytes).concat(), bytes.to_vec());
     }
 
     #[test]
