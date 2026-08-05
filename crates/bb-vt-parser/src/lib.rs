@@ -55,7 +55,7 @@
 //! let mut parser = Parser::new();
 //! let events = parser.feed(&mut screen, b"\x1b[1mhello\x07");
 //! assert_eq!(screen.row_text(screen.absolute_row(0)).as_deref(), Some("hello"));
-//! assert!(screen.pen().bold);
+//! assert!(screen.pen().bold());
 //! // The bell fired with the cursor just past "hello" on the first row.
 //! assert_eq!(events, vec![PositionedEvent::new(VtEvent::Bell, 0, 5)]);
 //! ```
