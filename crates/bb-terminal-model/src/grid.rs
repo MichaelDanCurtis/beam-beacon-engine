@@ -423,11 +423,11 @@ mod tests {
         let mut g = Grid::new(4, 4);
         let c = g.cell_mut(1, 2).unwrap();
         c.ch = 'X';
-        c.attrs.bold = true;
+        c.attrs.set_bold(true);
         c.attrs.fg = Color::Rgb(255, 0, 0);
         let read = g.cell(1, 2).unwrap();
         assert_eq!(read.ch, 'X');
-        assert!(read.attrs.bold);
+        assert!(read.attrs.bold());
         assert_eq!(read.attrs.fg, Color::Rgb(255, 0, 0));
     }
 
@@ -483,13 +483,13 @@ mod tests {
     #[test]
     fn grid_resize_preserving_keeps_the_overlapping_region() {
         let mut g = grid_with_letters(3, 3);
-        g.cell_mut(1, 1).unwrap().attrs.bold = true;
+        g.cell_mut(1, 1).unwrap().attrs.set_bold(true);
         g.resize_preserving(2, 2, Cell::default());
         assert_eq!(g.dimensions(), (2, 2));
         assert_eq!(g.cell(0, 0).unwrap().ch, 'A');
         assert_eq!(g.cell(0, 1).unwrap().ch, 'A');
         assert_eq!(g.cell(1, 0).unwrap().ch, 'B');
-        assert!(g.cell(1, 1).unwrap().attrs.bold); // attributes survive
+        assert!(g.cell(1, 1).unwrap().attrs.bold()); // attributes survive
         assert!(g.cell(2, 0).is_none()); // row 'C' dropped
     }
 

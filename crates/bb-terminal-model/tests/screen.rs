@@ -146,12 +146,12 @@ fn zero_dimensions_are_clamped_to_one() {
 #[test]
 fn print_writes_char_with_pen_and_advances() {
     let mut s = Screen::new(2, 10);
-    s.pen_mut().bold = true;
+    s.pen_mut().set_bold(true);
     s.pen_mut().fg = Color::Indexed(2);
     s.print('A');
     let cell = s.grid().cell(0, 0).unwrap();
     assert_eq!(cell.ch, 'A');
-    assert!(cell.attrs.bold);
+    assert!(cell.attrs.bold());
     assert_eq!(cell.attrs.fg, Color::Indexed(2));
     assert_eq!(cell.width, CellWidth::Single);
     assert_eq!(s.cursor().col, 1);
@@ -765,22 +765,22 @@ fn origin_mode_makes_rows_region_relative() {
 #[test]
 fn save_and_restore_cursor_round_trips_position_pen_and_origin() {
     let mut s = Screen::new(4, 4);
-    s.pen_mut().bold = true;
+    s.pen_mut().set_bold(true);
     s.cursor_goto(2, 3);
     s.save_cursor();
-    s.pen_mut().bold = false;
-    s.pen_mut().italic = true;
+    s.pen_mut().set_bold(false);
+    s.pen_mut().set_italic(true);
     s.cursor_goto(0, 0);
     s.restore_cursor();
     assert_eq!((s.cursor().row, s.cursor().col), (2, 3));
-    assert!(s.pen().bold);
-    assert!(!s.pen().italic);
+    assert!(s.pen().bold());
+    assert!(!s.pen().italic());
 }
 
 #[test]
 fn restore_without_save_resets_to_defaults() {
     let mut s = Screen::new(4, 4);
-    s.pen_mut().bold = true;
+    s.pen_mut().set_bold(true);
     s.cursor_goto(2, 2);
     s.set_scroll_region(2, 3);
     s.set_origin_mode(true);
@@ -985,13 +985,13 @@ fn erase_uses_pen_background_color() {
     let mut s = Screen::new(1, 3);
     put(&mut s, 0, "abc");
     s.pen_mut().bg = Color::Indexed(3);
-    s.pen_mut().bold = true; // must NOT carry into blanks
+    s.pen_mut().set_bold(true); // must NOT carry into blanks
     s.cursor_goto(0, 0);
     s.erase_in_line(EraseMode::All);
     let cell = s.grid().cell(0, 1).unwrap();
     assert_eq!(cell.ch, ' ');
     assert_eq!(cell.attrs.bg, Color::Indexed(3));
-    assert!(!cell.attrs.bold);
+    assert!(!cell.attrs.bold());
 }
 
 #[test]
@@ -1413,7 +1413,7 @@ fn resize_preserves_content_and_keeps_scrollback() {
 #[test]
 fn resize_growing_keeps_cells_and_attrs_and_blanks_the_new_area() {
     let mut s = Screen::new(3, 6);
-    s.pen_mut().bold = true;
+    s.pen_mut().set_bold(true);
     s.pen_mut().fg = Color::Indexed(4);
     put(&mut s, 0, "row0ab");
     *s.pen_mut() = CellAttrs::default();
@@ -1429,9 +1429,9 @@ fn resize_growing_keeps_cells_and_attrs_and_blanks_the_new_area() {
     assert_eq!(grid_text(&s, 3), ""); // new rows are blank
     assert_eq!(grid_text(&s, 4), "");
     let kept = s.grid().cell(0, 0).unwrap();
-    assert!(kept.attrs.bold); // attributes survive the resize
+    assert!(kept.attrs.bold()); // attributes survive the resize
     assert_eq!(kept.attrs.fg, Color::Indexed(4));
-    assert!(!s.grid().cell(1, 0).unwrap().attrs.bold);
+    assert!(!s.grid().cell(1, 0).unwrap().attrs.bold());
     assert_eq!(*s.grid().cell(0, 6).unwrap(), Cell::default()); // new column
     assert_eq!((s.cursor().row, s.cursor().col), (2, 5)); // cursor unmoved
 }
@@ -1766,7 +1766,7 @@ fn reset_restores_defaults_but_keeps_scrollback() {
     s.erase_in_display(EraseMode::All); // seed scrollback
     s.enter_alt_screen();
     put(&mut s, 1, "alt");
-    s.pen_mut().bold = true;
+    s.pen_mut().set_bold(true);
     s.set_origin_mode(true);
     s.set_insert_mode(true);
     s.set_autowrap(false);
@@ -1803,12 +1803,12 @@ fn resize_growth_fills_the_new_area_with_the_pen_background() {
     let mut s = Screen::new(2, 3);
     put(&mut s, 0, "ab");
     s.pen_mut().bg = Color::Indexed(5);
-    s.pen_mut().bold = true; // must NOT carry into the new cells
+    s.pen_mut().set_bold(true); // must NOT carry into the new cells
     s.resize(4, 5);
     let new_col = s.grid().cell(0, 4).unwrap();
     assert_eq!(new_col.ch, ' ');
     assert_eq!(new_col.attrs.bg, Color::Indexed(5));
-    assert!(!new_col.attrs.bold);
+    assert!(!new_col.attrs.bold());
     let new_row = s.grid().cell(3, 0).unwrap();
     assert_eq!(new_row.attrs.bg, Color::Indexed(5));
     assert_eq!(grid_text(&s, 0), "ab"); // old content untouched
@@ -1818,12 +1818,12 @@ fn resize_growth_fills_the_new_area_with_the_pen_background() {
 fn entering_the_alt_screen_clears_to_the_pen_background() {
     let mut s = Screen::new(2, 3);
     s.pen_mut().bg = Color::Indexed(2);
-    s.pen_mut().underline = true;
+    s.pen_mut().set_underline(true);
     s.enter_alt_screen();
     let cell = s.grid().cell(1, 1).unwrap();
     assert_eq!(cell.ch, ' ');
     assert_eq!(cell.attrs.bg, Color::Indexed(2));
-    assert!(!cell.attrs.underline);
+    assert!(!cell.attrs.underline());
 }
 
 // ---------------------------------------------------------------------------
@@ -1980,7 +1980,7 @@ fn soft_reset_restores_modes_without_clearing_the_screen() {
     put(&mut s, 0, "keep me");
     s.erase_in_display(EraseMode::All); // seed scrollback
     put(&mut s, 0, "on screen");
-    s.pen_mut().bold = true;
+    s.pen_mut().set_bold(true);
     s.pen_mut().bg = Color::Indexed(6);
     s.set_origin_mode(true);
     s.set_insert_mode(true);

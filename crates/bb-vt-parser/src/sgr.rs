@@ -18,14 +18,14 @@ pub(crate) fn apply(pen: &mut CellAttrs, params: &[Vec<u16>]) {
         let code = parts.first().copied().unwrap_or(0);
         match code {
             0 => *pen = CellAttrs::default(),
-            1 => pen.bold = true,
-            2 => pen.dim = true,
-            3 => pen.italic = true,
-            4 => pen.underline = true,
-            5 | 6 => pen.blink = true,
-            7 => pen.reverse = true,
-            8 => pen.hidden = true,
-            9 => pen.strikethrough = true,
+            1 => pen.set_bold(true),
+            2 => pen.set_dim(true),
+            3 => pen.set_italic(true),
+            4 => pen.set_underline(true),
+            5 | 6 => pen.set_blink(true),
+            7 => pen.set_reverse(true),
+            8 => pen.set_hidden(true),
+            9 => pen.set_strikethrough(true),
             // KNOWN DIVERGENCE: ECMA-48 and xterm ctlseqs both define SGR
             // 21 as *doubly underlined*. We treat it as bold-off instead
             // — the rival convention several terminals (the Linux console
@@ -35,20 +35,20 @@ pub(crate) fn apply(pen: &mut CellAttrs, params: &[Vec<u16>]) {
             // `CellAttrs::underline` is a plain bool with no underline
             // *style*, so "doubly" has nowhere faithful to go, and adding
             // a field was out of scope here. Intensity itself is fully
-            // representable — `bold` and `dim` are independent fields —
+            // representable — bold and dim are independent flags —
             // which is why 22 correctly clears both.
             //
             // Revisit if `CellAttrs` ever grows an underline style.
             21 | 22 => {
-                pen.bold = false;
-                pen.dim = false;
+                pen.set_bold(false);
+                pen.set_dim(false);
             }
-            23 => pen.italic = false,
-            24 => pen.underline = false,
-            25 => pen.blink = false,
-            27 => pen.reverse = false,
-            28 => pen.hidden = false,
-            29 => pen.strikethrough = false,
+            23 => pen.set_italic(false),
+            24 => pen.set_underline(false),
+            25 => pen.set_blink(false),
+            27 => pen.set_reverse(false),
+            28 => pen.set_hidden(false),
+            29 => pen.set_strikethrough(false),
             30..=37 => pen.fg = indexed(code - 30),
             39 => pen.fg = Color::Default,
             40..=47 => pen.bg = indexed(code - 40),

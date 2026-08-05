@@ -734,8 +734,8 @@ fn decstr_requires_no_private_marker() {
 fn sgr_basic_attributes() {
     let (s, _) = run(b"\x1b[1;2;3;4;5;7;8;9m");
     let pen = s.pen();
-    assert!(pen.bold && pen.dim && pen.italic && pen.underline);
-    assert!(pen.blink && pen.reverse && pen.hidden && pen.strikethrough);
+    assert!(pen.bold() && pen.dim() && pen.italic() && pen.underline());
+    assert!(pen.blink() && pen.reverse() && pen.hidden() && pen.strikethrough());
 }
 
 #[test]
@@ -752,11 +752,11 @@ fn sgr_resets() {
     // as doubly-underlined, but `CellAttrs::underline` has no style, so
     // we follow the rival bold-off convention instead. See `sgr.rs`.
     let (s, _) = run(b"\x1b[1m\x1b[21m");
-    assert!(!s.pen().bold);
+    assert!(!s.pen().bold());
     // 22 is "normal intensity" and clears both, which the model can
     // represent exactly — `bold` and `dim` are independent fields.
     let (s, _) = run(b"\x1b[1;2m\x1b[22m");
-    assert!(!s.pen().bold && !s.pen().dim);
+    assert!(!s.pen().bold() && !s.pen().dim());
 }
 
 #[test]
@@ -799,7 +799,7 @@ fn sgr_truecolor_semicolon_form() {
     // Attributes after the color are still applied.
     let (s, _) = run(b"\x1b[38;2;1;2;3;1m");
     assert_eq!(s.pen().fg, Color::Rgb(1, 2, 3));
-    assert!(s.pen().bold);
+    assert!(s.pen().bold());
 }
 
 #[test]
@@ -816,7 +816,7 @@ fn sgr_colon_forms() {
     // Colon form does not swallow following parameters.
     let (s, _) = run(b"\x1b[38:5:9;1m");
     assert_eq!(s.pen().fg, Color::Indexed(9));
-    assert!(s.pen().bold);
+    assert!(s.pen().bold());
 }
 
 #[test]
@@ -824,7 +824,7 @@ fn sgr_applies_to_printed_cells() {
     let (s, _) = run(b"\x1b[1;31mX");
     let cell = s.grid().cell(0, 0).unwrap();
     assert_eq!(cell.ch, 'X');
-    assert!(cell.attrs.bold);
+    assert!(cell.attrs.bold());
     assert_eq!(cell.attrs.fg, Color::Indexed(1));
 }
 

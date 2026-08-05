@@ -70,22 +70,120 @@ pub struct CellAttrs {
     pub fg: Color,
     /// Background color.
     pub bg: Color,
+    /// Style flags, bit-packed.
+    ///
+    /// Packing the eight style booleans into one `u16` (instead of eight
+    /// `bool` fields) shrinks [`Cell`] from 24 to 16 bytes. Scrollback is
+    /// the engine's dominant allocation — cells × retained rows — so this
+    /// is a third of every session's history memory. Read and write the
+    /// flags through the accessor pairs ([`CellAttrs::bold`] /
+    /// [`CellAttrs::set_bold`], …).
+    pub(crate) flags: u16,
+}
+
+impl CellAttrs {
+    pub(crate) const BOLD: u16 = 1 << 0;
+    pub(crate) const ITALIC: u16 = 1 << 1;
+    pub(crate) const UNDERLINE: u16 = 1 << 2;
+    pub(crate) const REVERSE: u16 = 1 << 3;
+    pub(crate) const STRIKETHROUGH: u16 = 1 << 4;
+    pub(crate) const DIM: u16 = 1 << 5;
+    pub(crate) const BLINK: u16 = 1 << 6;
+    pub(crate) const HIDDEN: u16 = 1 << 7;
+
+    #[inline]
+    fn get(&self, mask: u16) -> bool {
+        self.flags & mask != 0
+    }
+
+    #[inline]
+    fn set(&mut self, mask: u16, on: bool) {
+        if on {
+            self.flags |= mask;
+        } else {
+            self.flags &= !mask;
+        }
+    }
+
     /// Bold (SGR 1).
-    pub bold: bool,
+    pub fn bold(&self) -> bool {
+        self.get(Self::BOLD)
+    }
+
+    /// Set bold (SGR 1 / part of SGR 22).
+    pub fn set_bold(&mut self, on: bool) {
+        self.set(Self::BOLD, on);
+    }
+
     /// Italic (SGR 3).
-    pub italic: bool,
+    pub fn italic(&self) -> bool {
+        self.get(Self::ITALIC)
+    }
+
+    /// Set italic (SGR 3 / SGR 23).
+    pub fn set_italic(&mut self, on: bool) {
+        self.set(Self::ITALIC, on);
+    }
+
     /// Underline (SGR 4).
-    pub underline: bool,
+    pub fn underline(&self) -> bool {
+        self.get(Self::UNDERLINE)
+    }
+
+    /// Set underline (SGR 4 / SGR 24).
+    pub fn set_underline(&mut self, on: bool) {
+        self.set(Self::UNDERLINE, on);
+    }
+
     /// Reverse video (SGR 7).
-    pub reverse: bool,
+    pub fn reverse(&self) -> bool {
+        self.get(Self::REVERSE)
+    }
+
+    /// Set reverse video (SGR 7 / SGR 27).
+    pub fn set_reverse(&mut self, on: bool) {
+        self.set(Self::REVERSE, on);
+    }
+
     /// Strikethrough (SGR 9).
-    pub strikethrough: bool,
+    pub fn strikethrough(&self) -> bool {
+        self.get(Self::STRIKETHROUGH)
+    }
+
+    /// Set strikethrough (SGR 9 / SGR 29).
+    pub fn set_strikethrough(&mut self, on: bool) {
+        self.set(Self::STRIKETHROUGH, on);
+    }
+
     /// Dim / faint (SGR 2).
-    pub dim: bool,
+    pub fn dim(&self) -> bool {
+        self.get(Self::DIM)
+    }
+
+    /// Set dim / faint (SGR 2 / part of SGR 22).
+    pub fn set_dim(&mut self, on: bool) {
+        self.set(Self::DIM, on);
+    }
+
     /// Blink (SGR 5).
-    pub blink: bool,
+    pub fn blink(&self) -> bool {
+        self.get(Self::BLINK)
+    }
+
+    /// Set blink (SGR 5/6 / SGR 25).
+    pub fn set_blink(&mut self, on: bool) {
+        self.set(Self::BLINK, on);
+    }
+
     /// Hidden (SGR 8).
-    pub hidden: bool,
+    pub fn hidden(&self) -> bool {
+        self.get(Self::HIDDEN)
+    }
+
+    /// Set hidden (SGR 8 / SGR 28).
+    pub fn set_hidden(&mut self, on: bool) {
+        self.set(Self::HIDDEN, on);
+    }
 }
 
 /// Cell foreground or background color.
@@ -129,6 +227,16 @@ mod tests {
     #[test]
     fn color_default_is_terminal_default() {
         assert_eq!(Color::default(), Color::Default);
+    }
+
+    #[test]
+    fn cell_stays_16_bytes() {
+        // Scrollback memory is cells x retained rows, so Cell's size is a
+        // budget, not an accident: 10k lines x 80 cols is 12.3 MB at 16
+        // bytes and 18.4 MB at the 24 bytes the unpacked layout cost.
+        // Growing Cell is allowed, but must be a deliberate decision.
+        assert_eq!(std::mem::size_of::<Cell>(), 16);
+        assert_eq!(std::mem::size_of::<CellAttrs>(), 10);
     }
 
     #[test]
